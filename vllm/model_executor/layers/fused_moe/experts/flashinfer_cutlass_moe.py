@@ -102,6 +102,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             activation_key,
             activation_format,
         )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.quant_config.use_nvfp4_w4a4:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
