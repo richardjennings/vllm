@@ -46,11 +46,12 @@ logger = init_logger(__name__)
 # Refuse loudly instead of serving garbage.
 _SM120_UNSUPPORTED_REASON = (
     "flashinfer_cutlass MoE with MXFP4 experts and MXFP8 activations is not "
-    "supported on SM120/SM121: the underlying TRT-LLM gen fused-MoE kernels "
-    "are only guaranteed on SM100/SM103 upstream, and serving with them on "
-    "SM120 silently corrupts output. Use --moe-backend auto (selects "
-    "DEEPGEMM_MXFP4 on SM120) or another supported backend. The NVFP4 "
-    "expert variants are unaffected by this refusal."
+    "supported on SM120: the underlying TRT-LLM gen fused-MoE kernels are "
+    "only guaranteed on SM100/SM103 upstream, and serving with them on SM120 "
+    "silently corrupts output. No corruption has been observed on SM121 "
+    "(gpt-oss-20b MXFP4xMXFP8 serves correctly on GB10), so SM121 stays "
+    "allowed. Use --moe-backend auto (selects DEEPGEMM_MXFP4 on SM120) or "
+    "another supported backend. The NVFP4 expert variants are unaffected."
 )
 
 
@@ -90,7 +91,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
         if (
-            current_platform.is_device_capability_family(120)
+            current_platform.get_device_capability() == (12, 0)
             and activation_key == kMxfp8Dynamic
         ):
             return False, _SM120_UNSUPPORTED_REASON
