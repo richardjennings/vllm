@@ -1,0 +1,56 @@
+name: Overlay image
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Stage the build context
+        run: overlay/build-context.sh "$RUNNER_TEMP/context"
+      - name: Free disk space for the base image
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          docker system prune --all --force
+          df -h /
+      - name: Build
+        run: |
+          . overlay/base.env
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}-${GITHUB_SHA::12}"
+          docker build --file overlay/Dockerfile --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.base.name="$BASE_IMAGE" \
+            --tag "$image" "$RUNNER_TEMP/context"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Check the image
+        run: |
+          . overlay/base.env
+          docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$IMAGE" \
+            | grep -qx "VLLM_BUILD_COMMIT=$BASE_COMMIT"
+          origin=$(docker run --rm --entrypoint python3 "$IMAGE" \
+            -c 'import importlib.util; print(importlib.util.find_spec("vllm").origin)')
+          test "$origin" = /usr/local/lib/python3.12/dist-packages/vllm/__init__.py
+      - name: Push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
