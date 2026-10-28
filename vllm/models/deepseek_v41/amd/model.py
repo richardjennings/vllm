@@ -75,6 +75,7 @@ from ..common.engram import (
     NgramHashState,
     can_share_engram_tables,
     gather_engram_hashes,
+    map_engram_disk_tables,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
@@ -1438,6 +1439,9 @@ class DeepseekV41LLMForCausalLM(
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.process_weights_after_loading()
+        map_engram_disk_tables(
+            islice(self.model.layers, self.model.start_layer, self.model.end_layer)
+        )
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
