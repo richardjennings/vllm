@@ -35,6 +35,7 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
 """
 
 import ctypes
+import functools
 import json
 import mmap
 import os
@@ -43,6 +44,7 @@ import sys
 import tempfile
 import weakref
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -977,6 +979,17 @@ _ENGRAM_SCALE_KEYS = (
     "layers.{}.engram.embed.weight_scale",
 )
 _SAFETENSORS_ITEMSIZE = {"F8_E4M3": 1, "F8_E8M0": 1, "U8": 1}
+# A row missing from the page cache blocks its reader for one disk read, so
+# the reads of a gather are split over threads to keep many in flight. Below
+# _DISK_ROWS_PER_READER rows per thread, handing out the work costs more than
+# the reads it overlaps (decode steps read a few hundred rows at most).
+_DISK_READERS = 16
+_DISK_ROWS_PER_READER = 256
+
+
+@functools.cache
+def _disk_reader_pool() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(_DISK_READERS, thread_name_prefix="engram-disk")
 
 
 def _safetensors_entry(path: Path, name: str) -> tuple[int, list[int], str]:
@@ -1116,14 +1129,31 @@ class EngramDiskTable:
         rows = rows[skip:]
         count = rows.numel()
         torch.sub(inverse, skip, out=self._host_compact[:n])
-        torch.index_select(self.weight, 0, rows, out=self._host_weight[:count])
-        torch.index_select(self.scales, 0, rows, out=self._host_scales[:count])
+        readers = min(_DISK_READERS, count // _DISK_ROWS_PER_READER)
+        if readers < 2:
+            self._read_rows(rows, 0, count)
+        else:
+            bounds = [count * i // readers for i in range(readers + 1)]
+            pool = _disk_reader_pool()
+            reads = [
+                pool.submit(self._read_rows, rows, start, end)
+                for start, end in zip(bounds, bounds[1:])
+            ]
+            for read in reads:
+                read.result()
         self.compact_ids[:n].copy_(self._host_compact[:n], non_blocking=True)
         self.compact_weight[:count].view(torch.uint8).copy_(
             self._host_weight[:count], non_blocking=True
         )
         self.compact_scales[:count].copy_(self._host_scales[:count], non_blocking=True)
         return count
+
+    def _read_rows(self, rows: torch.Tensor, start: int, end: int) -> None:
+        """Copy the table rows ``rows[start:end]`` into staging rows ``start:end``."""
+        assert self.weight is not None and self.scales is not None
+        ids = rows[start:end]
+        torch.index_select(self.weight, 0, ids, out=self._host_weight[start:end])
+        torch.index_select(self.scales, 0, ids, out=self._host_scales[start:end])
 
 
 class ParallelEngramEmbedding(nn.Module):
