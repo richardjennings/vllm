@@ -108,6 +108,7 @@ from ..common.engram import (
     can_share_engram_tables,
     gather_engram_hashes,
     map_engram_disk_tables,
+    stages_disk_engram,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from .ops.mhc import (
@@ -933,6 +934,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 self.engram_swa_prefix = swa_cache_module.prefix
 
+        # The model state hashes each step and stages its disk Engram rows
+        # before the forward (prepare_disk_engram), so captured graphs hold no
+        # host reads.
+        self.stages_disk_engram = self.engram_hash is not None and stages_disk_engram(
+            vllm_config
+        )
+        if self.stages_disk_engram:
+            assert self.engram_hash is not None
+            num_layers, max_ngram = self.engram_hash.multipliers.shape
+            num_heads = self.engram_hash.primes.shape[-1]
+            # Persistent so a captured graph reads each step's hashes on replay.
+            self.prepared_engram_hashes = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                num_layers,
+                (max_ngram - 1) * num_heads,
+                dtype=torch.int32,
+            )
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
@@ -950,6 +969,45 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def prepare_disk_engram(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        lookback_token_ids: torch.Tensor,
+    ) -> None:
+        """Hash the step's tokens and stage their disk Engram rows. Runs before
+        the forward: the rows are read on the host, which a graph cannot replay."""
+        assert self.engram_hash is not None
+        hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
+        hashes.copy_(
+            self.engram_hash(
+                input_ids,
+                positions,
+                query_start_loc,
+                image_sentinel_mask(input_ids),
+                lookback_token_ids,
+                image_sentinel_mask(lookback_token_ids),
+                None,
+                None,
+            )
+        )
+        self._prepare_engram_rows(hashes)
+
+    def _prepare_engram_rows(self, engram_hashes: torch.Tensor) -> None:
+        # Gather all Engram rows before entering the decoder layers.
+        # One gather feeds every layer sharing the DP-split table.
+        if self.engram_batch is not None:
+            self.engram_batch.prepare_embeddings(engram_hashes)
+            return
+        gathered_hashes = gather_engram_hashes(
+            engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+        )
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.prepare_embeddings(gathered_hashes[:, engram.layer_hash_index])
 
     def make_empty_intermediate_tensors(
         self,
@@ -1005,7 +1063,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # profile runs (KV cache unbound).
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
-        if (
+        if self.stages_disk_engram and input_ids is not None:
+            # prepare_disk_engram hashed this step and staged its rows.
+            engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
+            engram_mask = ~image_sentinel_mask(input_ids)
+        elif (
             self.engram_hash is not None
             and input_ids is not None
             and is_forward_context_available()
@@ -1048,20 +1110,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # hash still has to reach them.
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
             if engram_hashes is not None:
-                # Gather all Engram rows before entering the decoder layers.
-                # One gather feeds every layer sharing the DP-split table.
-                if self.engram_batch is not None:
-                    self.engram_batch.prepare_embeddings(engram_hashes)
-                else:
-                    gathered_hashes = gather_engram_hashes(
-                        engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
-                    )
-                    for layer in islice(self.layers, self.start_layer, self.end_layer):
-                        engram = getattr(layer, "engram", None)
-                        if engram is not None:
-                            engram.prepare_embeddings(
-                                gathered_hashes[:, engram.layer_hash_index]
-                            )
+                self._prepare_engram_rows(engram_hashes)
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:

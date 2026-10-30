@@ -1541,6 +1541,20 @@ class ParallelEngramEmbedding(nn.Module):
         return out[:, : self.n_hash_cols]
 
 
+def stages_disk_engram(vllm_config: VllmConfig) -> bool:
+    """Whether the V2 model state reads disk Engram rows before each forward,
+    which keeps the host reads out of CUDA graphs. DP-shared tables gather hash
+    ids with the forward's DP token metadata, so they still read in the forward.
+    """
+    engram_config = vllm_config.engram_config
+    return (
+        engram_config is not None
+        and engram_config.disk_offload
+        and vllm_config.use_v2_model_runner
+        and get_engram_dp_group() is None
+    )
+
+
 def map_engram_disk_tables(layers: Iterable[nn.Module]) -> None:
     """Point disk-offloaded Engram tables at the checkpoint files. Runs after
     load_weights, when a hub checkpoint is guaranteed to be on local disk."""
@@ -1967,10 +1981,12 @@ class Engram(nn.Module):
         vllm_config = get_current_vllm_config()
         engram_config = vllm_config.engram_config
         assert engram_config is not None
-        # The disk lookup is an eager break; FULL graphs capture breaks too.
+        # Rows staged before the forward work with any graph mode. Otherwise the
+        # disk lookup is an eager break, and FULL graphs capture breaks too.
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         if (
             engram_config.disk_offload
+            and not stages_disk_engram(vllm_config)
             and cudagraph_mode != CUDAGraphMode.NONE
             and (
                 not is_breakable_cudagraph_enabled()
@@ -1978,10 +1994,11 @@ class Engram(nn.Module):
             )
         ):
             raise ValueError(
-                "Engram disk_offload reads table rows on the host every step, "
-                "which a captured CUDA graph cannot replay. Use --enforce-eager, "
-                "or VLLM_USE_BREAKABLE_CUDAGRAPH=1 with "
-                "-cc.cudagraph_mode=PIECEWISE."
+                "Engram disk_offload reads table rows on the host inside the "
+                "forward unless the V2 model runner stages them (no DP-shared "
+                "tables), and a captured CUDA graph cannot replay host reads. Use "
+                "the V2 model runner, --enforce-eager, or "
+                "VLLM_USE_BREAKABLE_CUDAGRAPH=1 with -cc.cudagraph_mode=PIECEWISE."
             )
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
@@ -1997,7 +2014,8 @@ class Engram(nn.Module):
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
         # Persistent storage keeps lookup addresses stable across graph replays.
-        self.staged_rows = torch.empty(
+        # Zeroed, as graph captures read it before any step has staged rows.
+        self.staged_rows = torch.zeros(
             max_tokens * self.embed_tokens.dp_size,
             self.embed_tokens.part_n_hash_cols,
             head_dim,

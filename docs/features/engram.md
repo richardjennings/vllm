@@ -113,7 +113,10 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
   `use_thp`, or `embedding_across_dp`.
 - The checkpoint must stay on local disk (a directory or a complete Hugging
   Face cache snapshot).
-- The lookup runs on the host, so it cannot be captured in a CUDA graph. Use
+- The lookup runs on the host, so it cannot be captured in a CUDA graph. The
+  V2 model runner reads each step's rows before the forward, so every graph
+  mode works, unless the tables are shared across DP ranks. Otherwise the read
+  happens inside the forward: use
   `--enforce-eager`, or `VLLM_USE_BREAKABLE_CUDAGRAPH=1` with
   `-cc.cudagraph_mode=PIECEWISE`; other graph modes are rejected at startup.
 
@@ -164,6 +167,6 @@ IPC namespace across the co-located replicas.
   `--enable-dbo` and set `--ubatch-size 0`.
 - `dp_shared_memory` requires `cpu_offload`, `data_parallel_size > 1`, and is
   unsupported with elastic expert parallelism.
-- `disk_offload` supports DeepSeek V4.1 only, needs `--enforce-eager` or
-  piecewise breakable CUDA graphs, and is unsupported with elastic expert
-  parallelism.
+- `disk_offload` supports DeepSeek V4.1 only, needs the V2 model runner,
+  `--enforce-eager` or piecewise breakable CUDA graphs, and is unsupported with
+  elastic expert parallelism.

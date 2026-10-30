@@ -209,6 +209,12 @@ class DeepseekV41ModelState(DefaultModelState):
             self.lookback_token_ids = torch.full(
                 (max_local_reqs, depth), -1, dtype=torch.int32, device=device
             )
+        # Models that read disk Engram rows here, before each forward.
+        self.disk_engram_models = tuple(
+            module
+            for module in model.modules()
+            if getattr(module, "stages_disk_engram", False)
+        )
 
         # Per request state index; batches gather from it (see prepare_attn).
         self._replay_start_np = np.zeros(self.max_num_reqs, dtype=np.int32)
@@ -312,6 +318,13 @@ class DeepseekV41ModelState(DefaultModelState):
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
         model_inputs["lookback_token_ids"] = window
+        for model in self.disk_engram_models:
+            model.prepare_disk_engram(
+                input_batch.input_ids,
+                input_batch.positions,
+                input_batch.query_start_loc,
+                window,
+            )
         return model_inputs
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:

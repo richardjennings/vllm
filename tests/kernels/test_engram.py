@@ -817,19 +817,24 @@ def test_engram_disk_offload_reconstructs_checkpoint(
 
 
 @pytest.mark.parametrize(
-    "mode,breakable,ok",
+    "mode,breakable,v2,ok",
     [
-        ("NONE", False, True),
-        ("PIECEWISE", True, True),
-        ("PIECEWISE", False, False),
-        ("FULL", True, False),
-        ("FULL_AND_PIECEWISE", True, False),
-        ("FULL_AND_PIECEWISE", False, False),
+        ("NONE", False, False, True),
+        ("PIECEWISE", True, False, True),
+        ("PIECEWISE", False, False, False),
+        ("FULL", True, False, False),
+        ("FULL_AND_PIECEWISE", True, False, False),
+        ("FULL_AND_PIECEWISE", False, False, False),
+        ("FULL", False, True, True),
+        ("FULL_AND_PIECEWISE", True, True, True),
+        ("PIECEWISE", False, True, True),
     ],
 )
-def test_engram_disk_offload_graph_modes(mode, breakable, ok, monkeypatch):
-    """The disk lookup is an eager break: only eager and breakable PIECEWISE
-    graphs can replay it, so every other mode fails at model construction."""
+def test_engram_disk_offload_graph_modes(mode, breakable, v2, ok, monkeypatch):
+    """On the V1 runner the disk lookup is an eager break in the forward: only
+    eager and breakable PIECEWISE graphs can replay it, so every other mode
+    fails at model construction. The V2 runner stages the rows before the
+    forward, so every mode works."""
     from vllm.config import CUDAGraphMode
 
     config = SimpleNamespace(
@@ -841,6 +846,7 @@ def test_engram_disk_offload_graph_modes(mode, breakable, ok, monkeypatch):
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode[mode]),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        use_v2_model_runner=v2,
     )
     monkeypatch.setattr(engram_ops, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(engram_ops, "is_breakable_cudagraph_enabled", lambda: breakable)
