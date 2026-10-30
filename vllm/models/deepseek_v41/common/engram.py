@@ -43,8 +43,8 @@ import struct
 import sys
 import tempfile
 import weakref
-from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -985,11 +985,21 @@ _SAFETENSORS_ITEMSIZE = {"F8_E4M3": 1, "F8_E8M0": 1, "U8": 1}
 # the reads it overlaps (decode steps read a few hundred rows at most).
 _DISK_READERS = 16
 _DISK_ROWS_PER_READER = 256
+# Prefetches run off the critical path, behind a whole step of GPU work, so
+# they keep more reads in flight than a gather does.
+_PREFETCH_READERS = 32
 
 
 @functools.cache
 def _disk_reader_pool() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(_DISK_READERS, thread_name_prefix="engram-disk")
+
+
+@functools.cache
+def _disk_prefetch_pool() -> ThreadPoolExecutor:
+    # Separate from the gather pool, so a step's own reads never queue behind
+    # a prefetch.
+    return ThreadPoolExecutor(_PREFETCH_READERS, thread_name_prefix="engram-prefetch")
 
 
 def _safetensors_entry(path: Path, name: str) -> tuple[int, list[int], str]:
@@ -1154,6 +1164,67 @@ class EngramDiskTable:
         ids = rows[start:end]
         torch.index_select(self.weight, 0, ids, out=self._host_weight[start:end])
         torch.index_select(self.scales, 0, ids, out=self._host_scales[start:end])
+
+    def prefetch(self, local_ids: torch.Tensor) -> None:
+        """Read the pages of the rows in host ``local_ids`` (rank-local, -1 = not
+        owned) into the page cache, so a later gather of them finds them there.
+
+        Leaves the gather's staging buffers alone: it may be running meanwhile.
+        """
+        assert self.weight is not None and self.scales is not None, (
+            "Engram disk table used before map()"
+        )
+        ids = local_ids.flatten()
+        # Sorted, so the page-cache reads run in file order.
+        rows = torch.unique(ids[(ids >= 0) & (ids < self.num_rows)])
+        if not rows.numel():
+            return
+        parts = max(1, min(_PREFETCH_READERS, rows.numel() // _DISK_ROWS_PER_READER))
+        pool = _disk_prefetch_pool()
+        reads = [
+            pool.submit(self._touch_rows, part) for part in rows.tensor_split(parts)
+        ]
+        for read in reads:
+            read.result()
+
+    def _touch_rows(self, rows: torch.Tensor) -> None:
+        """Fault in the pages of ``rows`` by reading one byte of each."""
+        assert self.weight is not None and self.scales is not None
+        torch.index_select(self.weight[:, 0], 0, rows)
+        torch.index_select(self.scales[:, 0], 0, rows)
+
+
+class EngramDiskPrefetcher:
+    """Reads the Engram rows of coming prompt chunks into the page cache on a
+    background thread, while the GPU runs the current step.
+
+    Only the newest chunks matter: a job still queued when the next one arrives
+    is dropped. A failed job raises on the next submit.
+    """
+
+    def __init__(self) -> None:
+        self._worker = ThreadPoolExecutor(1, thread_name_prefix="engram-prefetch-job")
+        self._pending: Future[None] | None = None
+
+    def submit(
+        self,
+        embeddings: Sequence[tuple["ParallelEngramEmbedding", int]],
+        hashes: torch.Tensor,
+    ) -> None:
+        """Prefetch, for each (embedding, layer hash index), the rows of the host
+        ``hashes`` [tokens, layers, hash columns]."""
+        pending = self._pending
+        if pending is not None and not pending.cancel() and pending.done():
+            pending.result()
+        self._pending = self._worker.submit(self._run, embeddings, hashes)
+
+    @staticmethod
+    def _run(
+        embeddings: Sequence[tuple["ParallelEngramEmbedding", int]],
+        hashes: torch.Tensor,
+    ) -> None:
+        for embedding, layer_hash_index in embeddings:
+            embedding.prefetch_disk(hashes[:, layer_hash_index])
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -1485,6 +1556,15 @@ class ParallelEngramEmbedding(nn.Module):
             self.part_num_embeddings
             * (self.dim + self.dim // self.block_size)
             / 1024**3,
+        )
+
+    def prefetch_disk(self, indices: torch.Tensor) -> None:
+        """Read the rows of host ``indices`` [tokens, n_hash_cols] that this
+        rank owns into the page cache (see ``EngramDiskTable.prefetch``)."""
+        assert self.disk_table is not None
+        head_end = self.head_start + self.part_n_hash_cols
+        self.disk_table.prefetch(
+            indices[:, self.head_start : head_end] - self.vocab_start_idx
         )
 
     def _lookup_disk(self, indices: torch.Tensor, out: torch.Tensor) -> None:

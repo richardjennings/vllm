@@ -103,6 +103,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from ..common.engram import (
     Engram,
     EngramBatch,
+    EngramDiskPrefetcher,
     EngramLayout,
     NgramHashState,
     can_share_engram_tables,
@@ -951,6 +952,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 (max_ngram - 1) * num_heads,
                 dtype=torch.int32,
             )
+            self.engram_prefetcher = EngramDiskPrefetcher()
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -976,24 +978,59 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         query_start_loc: torch.Tensor,
         lookback_token_ids: torch.Tensor,
+        upcoming: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> None:
         """Hash the step's tokens and stage their disk Engram rows. Runs before
-        the forward: the rows are read on the host, which a graph cannot replay."""
-        assert self.engram_hash is not None
+        the forward: the rows are read on the host, which a graph cannot replay.
+
+        ``upcoming`` holds the prompt chunks the next steps run, as (input ids,
+        positions, query start locations, lookback token ids). Their rows are
+        read into the page cache in the background while this step runs.
+        """
         hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
         hashes.copy_(
-            self.engram_hash(
-                input_ids,
-                positions,
-                query_start_loc,
-                image_sentinel_mask(input_ids),
-                lookback_token_ids,
-                image_sentinel_mask(lookback_token_ids),
-                None,
-                None,
+            self._disk_engram_hashes(
+                input_ids, positions, query_start_loc, lookback_token_ids
             )
         )
+        # Copied now, as the staging below waits for the hashes anyway.
+        upcoming_hashes = (
+            self._disk_engram_hashes(*upcoming).cpu() if upcoming is not None else None
+        )
         self._prepare_engram_rows(hashes)
+        if upcoming_hashes is not None:
+            # After the staging, so the prefetch does not slow this step's reads.
+            self._prefetch_engram_rows(upcoming_hashes)
+
+    def _disk_engram_hashes(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        lookback_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.engram_hash is not None
+        return self.engram_hash(
+            input_ids,
+            positions,
+            query_start_loc,
+            image_sentinel_mask(input_ids),
+            lookback_token_ids,
+            image_sentinel_mask(lookback_token_ids),
+            None,
+            None,
+        )
+
+    def _prefetch_engram_rows(self, engram_hashes: torch.Tensor) -> None:
+        self.engram_prefetcher.submit(
+            [
+                (layer.engram.embed_tokens, layer.engram.layer_hash_index)
+                for layer in islice(self.layers, self.start_layer, self.end_layer)
+                if getattr(layer, "engram", None) is not None
+            ],
+            engram_hashes,
+        )
 
     def _prepare_engram_rows(self, engram_hashes: torch.Tensor) -> None:
         # Gather all Engram rows before entering the decoder layers.

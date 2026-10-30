@@ -102,7 +102,9 @@ When the tables fit in neither GPU nor host memory (for example on an APU,
 where both are the same RAM), `disk_offload` reads them from the checkpoint
 files instead. Each rank memory-maps only its own rows, and each step copies
 the rows it needs to the GPU through the OS page cache. Frequent rows stay
-cached; the rest come from storage, so a local NVMe drive is recommended.
+cached; the rest come from storage, so a local NVMe drive is recommended. On
+the V2 model runner, the rows of each request's next prompt chunk are read into
+the page cache in the background while the current step runs.
 
 ```bash
 vllm serve deepseek-ai/DeepSeek-V4.1-Flash \

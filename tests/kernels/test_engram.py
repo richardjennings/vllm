@@ -5,6 +5,7 @@ import inspect
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -943,6 +944,89 @@ def test_engram_disk_offload_rejects_missing_table(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="layer 5's table or scales are missing"):
         layer.map_checkpoint(tmp_path)
+
+
+def test_plan_upcoming_prompt_chunks():
+    """Requests still prefilling after the step get their next chunk, capped at
+    the step's token budget; finished and decoding requests get none."""
+    from vllm.models.deepseek_v41.nvidia.model_state import (
+        plan_upcoming_prompt_chunks,
+    )
+
+    seq_lens = np.array([10, 4096, 300, 51, 7], dtype=np.int32)
+    prefill_lens = np.array([10, 30000, 1000, 50, 2055], dtype=np.int32)
+    rows, starts, lengths = plan_upcoming_prompt_chunks(seq_lens, prefill_lens, 2048)
+    assert rows.tolist() == [1, 2, 4]
+    assert starts.tolist() == [4096, 300, 7]
+    assert lengths.tolist() == [2048, 700, 2048]
+
+
+def test_engram_disk_table_prefetch_reads_owned_rows(tmp_path):
+    """A prefetch reads each owned row once, split over readers in file order,
+    and skips rows the rank does not own."""
+    dim, scale_dim, num_rows = 64, 2, 3000
+    path = tmp_path / "table.bin"
+    path.write_bytes(bytes(num_rows * dim))
+    table = engram_ops.EngramDiskTable.__new__(engram_ops.EngramDiskTable)
+    weight_map, table.weight = engram_ops._map_rows(path, 0, dim, num_rows)
+    scale_map, table.scales = engram_ops._map_rows(path, 0, scale_dim, num_rows)
+    table.num_rows = num_rows
+    # The real read faults in a byte of each row, through int32 hash ids.
+    engram_ops.EngramDiskTable._touch_rows(
+        table, torch.tensor([0, num_rows - 1], dtype=torch.int32)
+    )
+    touched: list[torch.Tensor] = []
+    table._touch_rows = touched.append
+    ids = torch.cat(
+        [torch.arange(999, -1, -1), torch.tensor([-1, num_rows, num_rows + 5, 7, 7])]
+    ).to(torch.int32)
+    table.prefetch(ids.view(-1, 5))
+    assert len(touched) == 1000 // engram_ops._DISK_ROWS_PER_READER
+    # Readers finish in any order; each reads a contiguous run of the rows.
+    parts = sorted(touched, key=lambda part: int(part[0]))
+    assert torch.cat(parts).tolist() == list(range(1000))
+    weight_map.close()
+    scale_map.close()
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+def test_engram_prefetch_disk_slices_local_heads(rank):
+    """Each rank prefetches its own heads' rows, as rank-local ids; the last
+    rank's short head shard is not padded."""
+    head_sizes = (17, 19, 23, 29, 31, 37, 41)
+    part = 2  # four shards of 2 heads over 7 heads: the last has one
+    layer = ParallelEngramEmbedding.__new__(ParallelEngramEmbedding)
+    torch.nn.Module.__init__(layer)
+    layer.part_n_hash_cols = part
+    layer.head_start = rank * part
+    layer.vocab_start_idx = sum(head_sizes[: layer.head_start])
+    seen: list[torch.Tensor] = []
+    layer.disk_table = SimpleNamespace(prefetch=seen.append)
+    hashes = torch.arange(5 * len(head_sizes), dtype=torch.int32).view(5, -1) + 100
+    layer.prefetch_disk(hashes)
+    expected = hashes[:, rank * part : (rank + 1) * part] - layer.vocab_start_idx
+    assert torch.equal(seen[0], expected)
+    assert seen[0].shape[1] == (1 if rank == 3 else part)
+
+
+def test_engram_disk_prefetcher_routes_layers_and_reraises():
+    """Each table gets its layer's hash columns, and a failed prefetch surfaces
+    on the next submit instead of vanishing on its thread."""
+    seen: list[torch.Tensor] = []
+
+    class Failing:
+        def prefetch_disk(self, indices):
+            raise RuntimeError("disk gone")
+
+    prefetcher = engram_ops.EngramDiskPrefetcher()
+    hashes = torch.arange(4 * 2 * 3, dtype=torch.int32).view(4, 2, 3)
+    prefetcher.submit([(SimpleNamespace(prefetch_disk=seen.append), 1)], hashes)
+    prefetcher._pending.result(timeout=5)
+    assert torch.equal(seen[0], hashes[:, 1])
+    prefetcher.submit([(Failing(), 0)], hashes)
+    prefetcher._pending.exception(timeout=5)
+    with pytest.raises(RuntimeError, match="disk gone"):
+        prefetcher.submit([(Failing(), 0)], hashes)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")

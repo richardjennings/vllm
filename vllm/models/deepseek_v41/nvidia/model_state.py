@@ -156,6 +156,17 @@ def _gather_replay_batch_kernel(
             )
 
 
+def plan_upcoming_prompt_chunks(
+    seq_lens: np.ndarray, prefill_lens: np.ndarray, budget: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The prompt tokens each request runs after this step, up to one step's
+    token budget, given its length after this step: the batch rows of the
+    requests still prefilling, and their chunks' starts and lengths."""
+    lengths = np.minimum(prefill_lens - seq_lens, budget)
+    rows = np.flatnonzero(lengths > 0)
+    return rows, seq_lens[rows], lengths[rows]
+
+
 class ReplayAttnMetadata(ModelSpecificAttnMetadata):
     """Hands the batch's replay starts to the sliding-window builders."""
 
@@ -318,14 +329,65 @@ class DeepseekV41ModelState(DefaultModelState):
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
         model_inputs["lookback_token_ids"] = window
-        for model in self.disk_engram_models:
-            model.prepare_disk_engram(
-                input_batch.input_ids,
-                input_batch.positions,
-                input_batch.query_start_loc,
-                window,
-            )
+        if self.disk_engram_models:
+            upcoming = self._upcoming_prompt_chunks(input_batch, req_states)
+            for model in self.disk_engram_models:
+                model.prepare_disk_engram(
+                    input_batch.input_ids,
+                    input_batch.positions,
+                    input_batch.query_start_loc,
+                    window,
+                    upcoming,
+                )
         return model_inputs
+
+    def _upcoming_prompt_chunks(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """The prompt chunks this batch's requests run next, as (input ids,
+        positions, query start locations, lookback token ids), so their disk
+        Engram rows can be read ahead. The prompt is known in full up front."""
+        assert self.lookback_token_ids is not None
+        num_reqs = input_batch.num_reqs
+        idx_mapping_np = input_batch.idx_mapping_np[:num_reqs]
+        rows, starts, lengths = plan_upcoming_prompt_chunks(
+            input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy(),
+            req_states.prefill_len.np[idx_mapping_np],
+            self.max_num_tokens,
+        )
+        if not rows.size:
+            return None
+        query_start_loc = np.zeros(rows.size + 1, dtype=np.int32)
+        np.cumsum(lengths, out=query_start_loc[1:])
+        num_tokens = int(query_start_loc[-1])
+        positions = np.repeat(starts - query_start_loc[:-1], lengths) + np.arange(
+            num_tokens
+        )
+        req_indices = idx_mapping_np[rows].astype(np.int32)
+        positions_gpu = torch.from_numpy(positions).to(
+            self.device, dtype=input_batch.positions.dtype
+        )
+        query_start_loc_gpu = torch.from_numpy(query_start_loc).to(self.device)
+        req_indices_gpu = torch.from_numpy(req_indices).to(self.device)
+        all_token_ids = req_states.all_token_ids.gpu
+        input_ids = all_token_ids[
+            torch.from_numpy(np.repeat(req_indices, lengths)).to(self.device).long(),
+            positions_gpu.long(),
+        ]
+        depth = self.lookback_token_ids.shape[1]
+        lookback = torch.empty(rows.size, depth, dtype=torch.int32, device=self.device)
+        _gather_lookback_kernel[(rows.size,)](
+            lookback,
+            req_indices_gpu,
+            query_start_loc_gpu,
+            positions_gpu,
+            all_token_ids,
+            all_token_ids.stride(0),
+            rows.size,
+            DEPTH=depth,
+            BLOCK_DEPTH=triton.next_power_of_2(depth),
+        )
+        return input_ids, positions_gpu, query_start_loc_gpu, lookback
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
