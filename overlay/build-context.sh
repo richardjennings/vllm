@@ -3,8 +3,8 @@
 # context for overlay/Dockerfile, and list them.
 # Usage: overlay/build-context.sh OUTPUT_DIR
 #
-# Only added or modified Python files under vllm/ can be copied over the
-# official image. Any other change needs a full image build and fails here.
+# Python files overlay the official package; the Rust frontend is rebuilt.
+# Changes to CUDA/C++ or other runtime inputs still require a full image build.
 set -euo pipefail
 
 out=${1:?usage: overlay/build-context.sh OUTPUT_DIR}
@@ -20,7 +20,9 @@ files=()
 refused=0
 while IFS=$'\t' read -r status path; do
     case "$path" in
-        tests/* | docs/* | overlay/* | .github/workflows/overlay-image.yml)
+        tests/* | docs/* | overlay/* | .buildkite/* | .github/workflows/overlay-image.yml)
+            continue ;;
+        rust/* | rust-toolchain.toml)
             continue ;;
         vllm/*.py)
             if [[ $status == [AM] ]]; then
@@ -45,4 +47,5 @@ for path in "${files[@]}"; do
     mkdir -p "$out/$(dirname "$path")"
     cp "$path" "$out/$path"
 done
+git archive HEAD rust rust-toolchain.toml | tar -x -C "$out"
 printf '%s\n' "${files[@]}"

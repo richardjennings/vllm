@@ -42,6 +42,20 @@ def test_chat_completion_request_accepts_minus_one_as_unlimited():
     assert request.thinking_token_budget is None
 
 
+@pytest.mark.parametrize("budget", [None, -1])
+def test_cumulative_thinking_requires_a_finite_budget(budget):
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking_token_budget": budget,
+            "thinking_token_budget_cumulative": True,
+        }
+    )
+    with pytest.raises(ValueError, match="requires thinking_token_budget"):
+        request.to_sampling_params(100, {})
+
+
 @pytest.mark.parametrize("raw_value", [0.6, 3.14, -2])
 def test_completion_request_rejects_invalid_thinking_token_budget(raw_value):
     with pytest.raises(VLLMValidationError, match="thinking_token_budget"):

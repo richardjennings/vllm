@@ -276,6 +276,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
     thinking_token_budget: ThinkingTokenBudget = None
+    thinking_token_budget_cumulative: bool = False
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -815,6 +816,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
             thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget_cumulative=self.thinking_token_budget_cumulative,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone

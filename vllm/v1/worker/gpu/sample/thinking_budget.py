@@ -55,6 +55,12 @@ class ThinkingBudgetState:
         )
         self.thinking_token_budget.np.fill(-1)
         self.thinking_token_budget.copy_to_uva()
+        self.cumulative_budget = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.cumulative_budget.np.fill(0)
+        self.cumulative_budget.copy_to_uva()
+        self.cached_completed_reasoning = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
         self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
 
         self.cached_last_start = torch.full(
@@ -93,6 +99,10 @@ class ThinkingBudgetState:
         if self.thinking_token_budget.np[req_idx] != budget:
             self.thinking_token_budget.np[req_idx] = budget
             self._budget_dirty = True
+        cumulative = int(sampling_params.thinking_token_budget_cumulative)
+        if self.cumulative_budget.np[req_idx] != cumulative:
+            self.cumulative_budget.np[req_idx] = cumulative
+            self._budget_dirty = True
         return use_thinking_budget
 
     def apply_staged_writes(self) -> None:
@@ -105,9 +115,11 @@ class ThinkingBudgetState:
             self.cached_last_start.index_fill_(0, idx, -1)
             self.cached_last_end.index_fill_(0, idx, -1)
             self.cached_scan_pos.index_fill_(0, idx, 0)
+            self.cached_completed_reasoning.index_fill_(0, idx, 0)
             self._reset_reqs.clear()
         if self._budget_dirty:
             self.thinking_token_budget.copy_to_uva()
+            self.cumulative_budget.copy_to_uva()
             self._budget_dirty = False
 
     def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> None:
@@ -130,6 +142,9 @@ class ThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
+            self.cumulative_budget.gpu,
+            self.req_states.prompt_len.gpu,
+            self.cached_completed_reasoning,
         )
 
 
@@ -164,8 +179,13 @@ def _update_committed_marker_cache_kernel(
     cached_scan_pos_ptr,
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
+    reasoning_end_token_ids_ptr,
+    cumulative_budget_ptr,
+    prompt_len_ptr,
+    cached_completed_reasoning_ptr,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
+    END_LEN: tl.constexpr,
     MAX_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -178,47 +198,72 @@ def _update_committed_marker_cache_kernel(
     scan_pos = tl.load(cached_scan_pos_ptr + req_state_idx)
     last_start = tl.load(cached_last_start_ptr + req_state_idx)
     last_end = tl.load(cached_last_end_ptr + req_state_idx)
+    cumulative = tl.load(cumulative_budget_ptr + req_state_idx) != 0
+    completed = tl.load(cached_completed_reasoning_ptr + req_state_idx)
 
     if scan_pos > total_len:
         scan_pos = 0
         last_start = -1
         last_end = -1
+        completed = 0
 
-    if scan_pos == 0 and last_start < 0 and last_end < 0:
+    cold = scan_pos == 0 and last_start < 0 and last_end < 0
+    if cold:
         # Cold scan: walk backward in vectorized blocks, stopping at the first
         # block with a marker; only the relative order of the two positions
         # found matters below.
-        block_hi = total_len
+        initial_len = total_len
+        if cumulative:
+            initial_len = tl.minimum(total_len, tl.load(prompt_len_ptr + req_state_idx))
+        block_hi = initial_len
         while block_hi > 0 and last_start < 0 and last_end < 0:
             block_lo = block_hi - BLOCK
             if block_lo < 0:
                 block_lo = 0
             offs = block_lo + tl.arange(0, BLOCK)
 
-            start_match = (offs < block_hi) & (offs + START_LEN <= total_len)
+            start_match = (offs < block_hi) & (offs + START_LEN <= initial_len)
             for j in tl.static_range(0, START_LEN):
                 expected = tl.load(reasoning_start_token_ids_ptr + j)
                 actual = tl.load(
                     all_token_ids_ptr + req_state_idx * all_token_ids_stride + offs + j,
-                    mask=offs + j < total_len,
+                    mask=offs + j < initial_len,
                     other=-1,
                 )
                 start_match = start_match & (actual == expected)
 
-            end_match = (offs < block_hi) & (offs + NATURAL_END_LEN <= total_len)
+            end_match = (offs < block_hi) & (offs + NATURAL_END_LEN <= initial_len)
             for j in tl.static_range(0, NATURAL_END_LEN):
                 expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
                 actual = tl.load(
                     all_token_ids_ptr + req_state_idx * all_token_ids_stride + offs + j,
-                    mask=offs + j < total_len,
+                    mask=offs + j < initial_len,
                     other=-1,
                 )
                 end_match = end_match & (actual == expected)
 
             last_start = tl.max(tl.where(start_match, offs, -1), axis=0)
             last_end = tl.max(tl.where(end_match, offs, -1), axis=0)
+            if cumulative:
+                forced_match = (offs < block_hi) & (offs + END_LEN <= initial_len)
+                for j in tl.static_range(0, END_LEN):
+                    expected = tl.load(reasoning_end_token_ids_ptr + j)
+                    actual = tl.load(
+                        all_token_ids_ptr
+                        + req_state_idx * all_token_ids_stride
+                        + offs
+                        + j,
+                        mask=offs + j < initial_len,
+                        other=-1,
+                    )
+                    forced_match = forced_match & (actual == expected)
+                last_end = tl.maximum(
+                    last_end, tl.max(tl.where(forced_match, offs, -1), axis=0)
+                )
             block_hi = block_lo
-    else:
+        if cumulative:
+            scan_pos = tl.maximum(0, initial_len - (MAX_LEN - 1))
+    if not cold or cumulative:
         for i in tl.range(scan_pos, total_len):
             if i + START_LEN <= total_len:
                 start_match = True
@@ -228,8 +273,10 @@ def _update_committed_marker_cache_kernel(
                         all_token_ids_ptr + req_state_idx * all_token_ids_stride + i + j
                     )
                     start_match = start_match & (actual == expected)
-                if start_match:
-                    last_start = i
+                # A repeated opening marker is content while a cumulative
+                # block is open; it cannot restart the thinking counter.
+                if start_match and (not cumulative or last_start <= last_end):
+                    last_start = tl.maximum(last_start, i)
 
             if i + NATURAL_END_LEN <= total_len:
                 end_match = True
@@ -240,10 +287,25 @@ def _update_committed_marker_cache_kernel(
                     )
                     end_match = end_match & (actual == expected)
                 if end_match:
-                    last_end = i
+                    if cumulative and i > last_end and last_start > last_end:
+                        completed += tl.maximum(0, i - last_start - START_LEN)
+                    last_end = tl.maximum(last_end, i)
+            if cumulative and i + END_LEN <= total_len:
+                forced_end_match = True
+                for j in tl.static_range(0, END_LEN):
+                    expected = tl.load(reasoning_end_token_ids_ptr + j)
+                    actual = tl.load(
+                        all_token_ids_ptr + req_state_idx * all_token_ids_stride + i + j
+                    )
+                    forced_end_match = forced_end_match & (actual == expected)
+                if forced_end_match:
+                    if i > last_end and last_start > last_end:
+                        completed += tl.maximum(0, i - last_start - START_LEN)
+                    last_end = tl.maximum(last_end, i)
 
     tl.store(cached_last_start_ptr + req_state_idx, last_start)
     tl.store(cached_last_end_ptr + req_state_idx, last_end)
+    tl.store(cached_completed_reasoning_ptr + req_state_idx, completed)
     new_scan_pos = total_len - (MAX_LEN - 1)
     if new_scan_pos < 0:
         new_scan_pos = 0
@@ -266,9 +328,12 @@ def _thinking_budget_kernel(
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
     reasoning_end_token_ids_ptr,
+    cumulative_budget_ptr,
+    cached_completed_reasoning_ptr,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
+    MAX_LEN: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -283,45 +348,63 @@ def _thinking_budget_kernel(
 
     last_start = tl.load(cached_last_start_ptr + req_state_idx)
     last_end = tl.load(cached_last_end_ptr + req_state_idx)
+    cumulative = tl.load(cumulative_budget_ptr + req_state_idx) != 0
+    if cumulative:
+        budget -= tl.load(cached_completed_reasoning_ptr + req_state_idx)
 
-    start_lo = total_len - START_LEN + 1
+    start_lo = total_len - MAX_LEN + 1
     if start_lo < 0:
         start_lo = 0
-    for i in tl.range(start_lo, effective_len - START_LEN + 1):
-        start_match = True
-        for j in tl.static_range(0, START_LEN):
-            expected = tl.load(reasoning_start_token_ids_ptr + j)
-            actual = _load_effective_token(
-                all_token_ids_ptr,
-                all_token_ids_stride,
-                input_ids_ptr,
-                cur_req_first_pos,
-                req_state_idx,
-                total_len,
-                i + j,
-            )
-            start_match = start_match & (actual == expected)
-        if start_match:
-            last_start = i
-
-    end_lo = total_len - NATURAL_END_LEN + 1
-    if end_lo < 0:
-        end_lo = 0
-    for i in tl.range(end_lo, effective_len - NATURAL_END_LEN + 1):
-        end_match = True
-        for j in tl.static_range(0, NATURAL_END_LEN):
-            expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
-            actual = _load_effective_token(
-                all_token_ids_ptr,
-                all_token_ids_stride,
-                input_ids_ptr,
-                cur_req_first_pos,
-                req_state_idx,
-                total_len,
-                i + j,
-            )
-            end_match = end_match & (actual == expected)
-        if end_match:
+    for i in tl.range(start_lo, effective_len):
+        if i + START_LEN <= effective_len:
+            start_match = True
+            for j in tl.static_range(0, START_LEN):
+                expected = tl.load(reasoning_start_token_ids_ptr + j)
+                actual = _load_effective_token(
+                    all_token_ids_ptr,
+                    all_token_ids_stride,
+                    input_ids_ptr,
+                    cur_req_first_pos,
+                    req_state_idx,
+                    total_len,
+                    i + j,
+                )
+                start_match = start_match & (actual == expected)
+            if start_match and (not cumulative or last_start <= last_end):
+                last_start = tl.maximum(last_start, i)
+        end_match = False
+        if i + NATURAL_END_LEN <= effective_len:
+            end_match = True
+            for j in tl.static_range(0, NATURAL_END_LEN):
+                expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
+                actual = _load_effective_token(
+                    all_token_ids_ptr,
+                    all_token_ids_stride,
+                    input_ids_ptr,
+                    cur_req_first_pos,
+                    req_state_idx,
+                    total_len,
+                    i + j,
+                )
+                end_match = end_match & (actual == expected)
+        if cumulative and i + END_LEN <= effective_len:
+            forced_end_match = True
+            for j in tl.static_range(0, END_LEN):
+                expected = tl.load(reasoning_end_token_ids_ptr + j)
+                actual = _load_effective_token(
+                    all_token_ids_ptr,
+                    all_token_ids_stride,
+                    input_ids_ptr,
+                    cur_req_first_pos,
+                    req_state_idx,
+                    total_len,
+                    i + j,
+                )
+                forced_end_match = forced_end_match & (actual == expected)
+            end_match = end_match | forced_end_match
+        if end_match and i > last_end:
+            if cumulative and last_start > last_end:
+                budget -= tl.maximum(0, i - last_start - START_LEN)
             last_end = i
 
     if last_start < 0 or last_start <= last_end:
@@ -380,6 +463,9 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
+    cumulative_budget: torch.Tensor,
+    prompt_len: torch.Tensor,
+    cached_completed_reasoning: torch.Tensor,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -397,9 +483,14 @@ def apply_thinking_budget(
         cached_scan_pos,
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
+        reasoning_end_token_ids,
+        cumulative_budget,
+        prompt_len,
+        cached_completed_reasoning,
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
-        MAX_LEN=max(start_len, natural_end_len),
+        END_LEN=end_len,
+        MAX_LEN=max(start_len, natural_end_len, end_len),
         BLOCK=_COLD_SCAN_BLOCK,
     )
 
@@ -418,7 +509,10 @@ def apply_thinking_budget(
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
+        cumulative_budget,
+        cached_completed_reasoning,
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
+        MAX_LEN=max(start_len, natural_end_len, end_len),
     )

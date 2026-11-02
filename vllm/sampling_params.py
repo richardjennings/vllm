@@ -430,6 +430,8 @@ class SamplingParams(
     skip_reading_prefix_cache: bool | None = None
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
+    thinking_token_budget_cumulative: bool = False
+    """Share the thinking budget across all reasoning blocks in this response."""
 
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
@@ -491,6 +493,7 @@ class SamplingParams(
         routed_experts_prompt_start: int = 0,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
+        thinking_token_budget_cumulative: bool = False,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Fast path uses a dict comprehension; on failure we iterate once
@@ -536,6 +539,7 @@ class SamplingParams(
             stop_token_ids=stop_token_ids,
             bad_words=bad_words,
             thinking_token_budget=thinking_token_budget,
+            thinking_token_budget_cumulative=thinking_token_budget_cumulative,
             include_stop_str_in_output=include_stop_str_in_output,
             ignore_eos=ignore_eos,
             max_tokens=max_tokens,
@@ -577,6 +581,10 @@ class SamplingParams(
         self.thinking_token_budget = validate_thinking_token_budget(
             self.thinking_token_budget
         )
+        if self.thinking_token_budget_cumulative and self.thinking_token_budget is None:
+            raise ValueError(
+                "thinking_token_budget_cumulative requires thinking_token_budget"
+            )
 
         if self.stop is None:
             self.stop = []
@@ -1467,6 +1475,8 @@ class SamplingParams(
             f"stop_token_ids={self.stop_token_ids}, "
             f"bad_words={self.bad_words}, "
             f"thinking_token_budget={self.thinking_token_budget}, "
+            f"thinking_token_budget_cumulative="
+            f"{self.thinking_token_budget_cumulative}, "
             f"include_stop_str_in_output={self.include_stop_str_in_output}, "
             f"ignore_eos={self.ignore_eos}, "
             f"max_tokens={self.max_tokens}, "

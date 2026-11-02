@@ -211,6 +211,8 @@ Then set `"eviction_policy": "my_policy"` in `kv_connector_extra_config`, the sa
 
 Each entry in `secondary_tiers` is a dict with a required `type` field plus tier-specific fields.
 
+Secondary tiers receive `touch` notifications when matching blocks are reused from GPU memory or finish loading from CPU to GPU. GPU reuse reaches them through `OffloadingManager.on_gpu_prefix_hit`; it does not invoke the CPU eviction policy's `touch` operation. Custom secondary tiers can use these notifications to maintain idle lifetimes for their stored copies.
+
 The filesystem and object-store tiers can publish hash-only `BlockStored` KV events for blocks they successfully store. Both tiers use the coarse-grained wire medium value `STORAGE`; the medium does not distinguish filesystem from object-store storage. To recover location semantics, set the optional `locality` field (`LOCAL` / `REMOTE`) on the tier entry — that field, not the medium, tells consumers whether the tier's blocks are local to the publishing vLLM instance. Set `enable_kv_events: true` in the tier's entry to opt in; events are published only when KV cache events are also enabled globally via `--kv-events-config`.
 
 Set the optional `locality` tier field to `LOCAL` or `REMOTE` to describe the tier's storage location relative to the publishing vLLM instance. `LOCAL` marks storage local to that instance, while `REMOTE` marks storage that is not local to it. When the setting is omitted, locality is unspecified. vLLM does not infer it from the tier type, so an `obj` tier is not implicitly `REMOTE`. A KV event includes `locality` only when the tier explicitly configures it. This metadata describes the tier property without implying that a consumer can already route requests to its blocks.
@@ -238,10 +240,24 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `root_dir` | yes | — | Base directory; vLLM creates subdirectories beneath it (see [On-Disk Layout](#on-disk-layout)). |
 | `n_read_threads` | no | `16` | Read-priority I/O threads (load path). |
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
+| `idle_ttl_seconds` | no | disabled | Positive idle lifetime in seconds, measured from last KV reuse. Set together with `max_bytes`. Requires exclusive ownership of `root_dir`. |
+| `max_bytes` | no | disabled | Positive integer limit for block-file bytes across `root_dir`, including space reserved for pending writes. Set together with `idle_ttl_seconds`. |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `STORAGE`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
 
 Each thread group prefers its own queue but pulls from the other when its primary queue is empty, so a write-heavy or read-heavy burst won't leave the off-priority queue waiting. Size the totals to your storage's effective concurrency.
+
+#### Idle expiry and disk budget
+
+For example, add `"idle_ttl_seconds": 10800, "max_bytes": 107374182400` to the FS tier configuration for a three-hour idle lifetime and a 100 GiB block budget. Use `7200` for two hours. These settings apply to every model/configuration namespace beneath `root_dir`.
+
+Reuse from GPU, CPU or disk refreshes the lifetime of the corresponding disk blocks. Merely checking whether a block exists does not refresh it. Expired blocks are misses immediately. Background maintenance runs at a one-second interval (or the TTL, if shorter); physical deletion can wait for active I/O or filesystem operations. Loads pin their blocks against eviction. Writes reserve their maximum size before starting and evict least recently used, unpinned blocks when needed. A batch that cannot fit is not offloaded; generation can continue using the ordinary cache-miss/recomputation path.
+
+Last-use timestamps are persisted during maintenance and at orderly shutdown. Startup scans existing block files, removes abandoned temporary block files and enforces the budget before accepting work. An abrupt process exit can lose unflushed reuse updates, causing earlier expiry after restart. The limit counts block contents and reserved temporary writes; filesystem metadata, directory entries and `config.json` are outside this byte budget. Filesystem errors are reported, and failed deletions do not release their disk budget.
+
+Retention takes an exclusive lock on `root_dir` for the lifetime of the tier. Use a dedicated directory per vLLM instance and a filesystem that supports advisory locks. This implementation also takes a shared lock when retention is disabled, so it cannot join a directory owned by a retention-enabled instance. Older binaries and external writers do not participate in this locking protocol and must not write into an owned directory. No client identifier is added to block hashes: compatible prefixes remain reusable across clients.
+
+The owner is the engine's filesystem-tier manager. Data-parallel engines need separate directories. During a rollout, a replacement using the same directory must wait until the previous owner has shut down and released its lock.
 
 #### On-Disk Layout
 
@@ -264,6 +280,8 @@ Inside that subdirectory, blocks are sharded across hash-prefix subdirectories t
 #### Cross-Process Sharing
 
 KV cache sharing between multiple vLLM instances using the same `root_dir` (e.g., via a shared PVC) works by default: `NONE_HASH` (the chain-hash seed for block content hashes) is derived from a fixed default seed, so identical token content produces identical block filenames across instances. To use a custom shared seed instead, set the `PYTHONHASHSEED` environment variable to the same value on every instance.
+
+Cross-process sharing requires leaving both retention settings disabled. With idle expiry and a disk budget enabled, the directory has one exclusive owner as described above.
 
 The exception is the non-cryptographic `xxhash` and `xxhash_cbor` values of `--prefix-caching-hash-algo`, which seed `NONE_HASH` randomly per process so the seed stays unpredictable. Sharing a cache across instances with those algorithms requires setting the same `PYTHONHASHSEED` on every instance.
 

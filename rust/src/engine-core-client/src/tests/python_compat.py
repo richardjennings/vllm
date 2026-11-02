@@ -41,6 +41,7 @@ class EngineCoreSamplingParams(msgspec.Struct, dict=True, omit_defaults=True):
     max_tokens: int = 16
     min_tokens: int = 0
     thinking_token_budget: int | None = None
+    thinking_token_budget_cumulative: bool = False
     min_p: float = 0.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -176,6 +177,7 @@ request = EngineCoreRequest(
         max_tokens=32,
         min_tokens=1,
         thinking_token_budget=256,
+        thinking_token_budget_cumulative=True,
         min_p=0.0,
         frequency_penalty=0.0,
         presence_penalty=0.0,

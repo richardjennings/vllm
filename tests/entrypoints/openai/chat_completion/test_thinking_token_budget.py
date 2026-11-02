@@ -8,15 +8,19 @@ Covers Qwen3-0.6B and Qwen3.5 FP8 + MTP.
 
 import asyncio
 import json
+import os
+from pathlib import Path
 from typing import Literal
 
 import openai
 import pytest
 import pytest_asyncio
+import torch
 
 from tests.utils import RemoteOpenAIServer, multi_gpu_only, requires_fp8
 from vllm.platforms import current_platform
 from vllm.tokenizers import get_tokenizer
+from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 QWEN35_FP8_MTP_MODEL = "Qwen/Qwen3.5-35B-A3B-FP8"
@@ -25,6 +29,32 @@ THINK_BUDGET = 5
 
 REASONING_START_STR = "<think>"
 REASONING_END_STR = "</think>"
+
+
+class ScriptedReasoningProcessor(AdapterLogitsProcessor):
+    """Make two reasoning blocks reproducible through the real HTTP sampler."""
+
+    def is_argmax_invariant(self) -> bool:
+        return False
+
+    def new_req_logits_processor(self, params):
+        script = (params.extra_args or {}).get("reasoning_test_script")
+        if script is None:
+            return None
+        script = json.loads(script)
+        tokens, end, answer = script["tokens"], script["end"], script["answer"]
+
+        def apply(output_ids: list[int], logits: torch.Tensor):
+            if output_ids.count(end) >= 2:
+                last_end = len(output_ids) - 1 - output_ids[::-1].index(end)
+                token = answer[min(len(output_ids) - last_end - 1, len(answer) - 1)]
+            else:
+                token = tokens[min(len(output_ids), len(tokens) - 1)]
+            logits.fill_(-10000)
+            logits[token] = 100
+            return logits
+
+        return apply
 
 
 def _count_reasoning_decode_token_ids_between_markers(
@@ -60,6 +90,8 @@ def _count_reasoning_decode_token_ids_between_markers(
 @pytest.fixture(scope="module")
 def server():
     args = [
+        "--logits-processors",
+        "tests.entrypoints.openai.chat_completion.test_thinking_token_budget:ScriptedReasoningProcessor",
         "--reasoning-parser",
         "qwen3",
         "--reasoning-config",
@@ -71,7 +103,19 @@ def server():
         "0.4",
         "--no-async-scheduling",
     ]
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+    env = {
+        "VLLM_USE_V2_MODEL_RUNNER": "0",
+        "PYTHONPATH": os.pathsep.join(
+            filter(
+                None,
+                [
+                    str(Path(__file__).resolve().parents[4]),
+                    os.environ.get("PYTHONPATH"),
+                ],
+            )
+        ),
+    }
+    with RemoteOpenAIServer(MODEL_NAME, args, env_dict=env) as remote_server:
         yield remote_server
 
 
@@ -173,7 +217,10 @@ async def test_thinking_token_budget_mixed_requests(client: openai.AsyncOpenAI):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client", ["default", "auto_config"], indirect=True)
-async def test_thinking_token_budget_limits_reasoning(client: openai.AsyncOpenAI):
+@pytest.mark.parametrize("cumulative", [False, True])
+async def test_thinking_token_budget_limits_reasoning(
+    client: openai.AsyncOpenAI, cumulative: bool
+):
     """Test that thinking_token_budget limits the number of reasoning tokens.
 
     Counts reasoning decode tokens by id, which is robust to how tokens are
@@ -191,7 +238,11 @@ async def test_thinking_token_budget_limits_reasoning(client: openai.AsyncOpenAI
         messages=MESSAGES,
         max_tokens=100,
         stream=True,
-        extra_body={"thinking_token_budget": THINK_BUDGET, "return_token_ids": True},
+        extra_body={
+            "thinking_token_budget": THINK_BUDGET,
+            "thinking_token_budget_cumulative": cumulative,
+            "return_token_ids": True,
+        },
     )
     async for chunk in stream:
         if not chunk.choices:
@@ -210,6 +261,54 @@ async def test_thinking_token_budget_limits_reasoning(client: openai.AsyncOpenAI
         f"reasoning tokens ({reasoning_token_count}) != "
         f"thinking_token_budget ({THINK_BUDGET})"
     )
+
+
+@pytest.mark.asyncio
+async def test_cumulative_budget_survives_a_second_reasoning_block(server):
+    tokenizer = get_tokenizer(tokenizer_name=MODEL_NAME)
+    start = tokenizer.encode(REASONING_START_STR, add_special_tokens=False)
+    end = tokenizer.encode(REASONING_END_STR, add_special_tokens=False)
+    payload = tokenizer.encode("A B C D E F G", add_special_tokens=False)
+    assert len(start) == len(end) == 1 and len(payload) == 7
+    script = {
+        "tokens": start + payload[:2] + end + start + payload[2:] + end,
+        "end": end[0],
+        "answer": tokenizer.encode("Done.", add_special_tokens=False)
+        + [tokenizer.eos_token_id],
+    }
+    async with server.get_async_client() as client:
+        for cumulative, expected in [(False, [2, 5]), (True, [2, 3])]:
+            stream = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=MESSAGES,
+                temperature=0,
+                max_tokens=40,
+                stream=True,
+                extra_body={
+                    "thinking_token_budget": 5,
+                    "thinking_token_budget_cumulative": cumulative,
+                    "return_token_ids": True,
+                    "vllm_xargs": {"reasoning_test_script": json.dumps(script)},
+                },
+            )
+            ids, content, finish = [], "", None
+            async for chunk in stream:
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    ids.extend(getattr(choice, "token_ids", None) or [])
+                    content += choice.delta.content or ""
+                    finish = choice.finish_reason or finish
+            counts, count, thinking = [], 0, False
+            for token in ids:
+                if token == start[0]:
+                    thinking, count = True, 0
+                elif token == end[0] and thinking:
+                    counts.append(count)
+                    thinking = False
+                elif thinking:
+                    count += 1
+            assert counts == expected, (cumulative, counts, ids)
+            assert finish == "stop" and "Done." in content
 
 
 @pytest.mark.asyncio

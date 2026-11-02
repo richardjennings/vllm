@@ -165,6 +165,7 @@ pub(super) fn prepare_chat_request(
             max_tokens: request.max_completion_tokens,
             min_tokens: request.min_tokens,
             thinking_token_budget: request.thinking_token_budget,
+            thinking_token_budget_cumulative: request.thinking_token_budget_cumulative,
             logprobs,
             prompt_logprobs,
             prompt_logprob_token_ids: None,
@@ -1112,6 +1113,22 @@ mod tests {
         assert_eq!(prepare(Some(64)), Some(64));
         assert_eq!(prepare(Some(-1)), Some(-1));
         assert_eq!(prepare(None), None);
+    }
+
+    #[test]
+    fn prepare_chat_request_preserves_cumulative_thinking_mode() {
+        let request = ChatCompletionRequest {
+            thinking_token_budget: Some(5),
+            thinking_token_budget_cumulative: true,
+            ..base_request()
+        };
+        let prepared = prepare_chat_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+        )
+        .expect("request is valid");
+        assert!(prepared.chat_request.sampling_params.thinking_token_budget_cumulative);
     }
 
     #[test]

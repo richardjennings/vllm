@@ -32,8 +32,10 @@ jobs:
       - name: Build
         run: |
           . overlay/base.env
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}-${GITHUB_SHA::12}"
+          branch=${GITHUB_REF_NAME//\//-}
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${branch}-${GITHUB_SHA::12}"
           docker build --file overlay/Dockerfile --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --build-arg VLLM_RS_BUILD_VERSION="overlay-${GITHUB_SHA::12}" \
             --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
             --label org.opencontainers.image.base.name="$BASE_IMAGE" \
@@ -47,6 +49,7 @@ jobs:
           origin=$(docker run --rm --entrypoint python3 "$IMAGE" \
             -c 'import importlib.util; print(importlib.util.find_spec("vllm").origin)')
           test "$origin" = /usr/local/lib/python3.12/dist-packages/vllm/__init__.py
+          docker run --rm --entrypoint /usr/local/lib/python3.12/dist-packages/vllm/vllm-rs "$IMAGE" --help > /dev/null
       - name: Push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

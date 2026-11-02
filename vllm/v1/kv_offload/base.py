@@ -397,6 +397,12 @@ class OffloadingManager(ABC):
         """
         return
 
+    def on_gpu_prefix_hit(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Notify tiers of GPU reuse without changing CPU cache recency policy."""
+        return
+
     @abstractmethod
     def prepare_store(
         self,

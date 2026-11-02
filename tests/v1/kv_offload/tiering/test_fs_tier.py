@@ -12,12 +12,15 @@ import mmap
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
 
+from tests.v1.kv_offload.conftest import make_offloading_config
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -35,11 +38,13 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
+from vllm.v1.kv_offload.tiering.fs.retention import DirectoryLock, FileRetention
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 # ---------------------------------------------------------------------------
@@ -1042,3 +1047,372 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+@pytest.fixture
+def retention(tmp_path):
+    # An explicit clock makes idle expiry deterministic without sleeping.
+    now = [time.time()]
+    policy = FileRetention(str(tmp_path), 10, 8, clock=lambda: now[0])
+    try:
+        yield policy, now
+    finally:
+        policy.close()
+
+
+def store_bytes(policy: FileRetention, path: Path, value: bytes) -> None:
+    def write() -> None:
+        path.write_bytes(value)
+
+    policy.store([str(path)], len(value), write)
+
+
+def test_retention_refreshes_reuse_and_survives_restart(tmp_path):
+    now = [time.time()]
+    path = tmp_path / "aa.bin"
+    policy = FileRetention(str(tmp_path), 10, 8, clock=lambda: now[0])
+    try:
+        store_bytes(policy, path, b"data")
+        now[0] += 9
+        policy.touch([str(path)])
+        policy.maintain()
+        assert path.stat().st_mtime == pytest.approx(now[0])
+    finally:
+        policy.close()
+    policy = FileRetention(str(tmp_path), 10, 8, clock=lambda: now[0])
+    try:
+        now[0] += 9
+        assert policy.contains(str(path))
+        # Checking availability must not extend the TTL.
+        now[0] += 1
+        assert not policy.contains(str(path))
+        policy.maintain()
+        assert not path.exists()
+        assert policy.accounted_bytes == 0
+    finally:
+        policy.close()
+
+
+def test_retention_evicts_lru_and_counts_partial_publication(retention, tmp_path):
+    policy, now = retention
+    a, b, c = [tmp_path / f"{letter}.bin" for letter in "abc"]
+    store_bytes(policy, a, b"aaaa")
+    now[0] += 1
+    store_bytes(policy, b, b"bbbb")
+    now[0] += 1
+    policy.touch([str(a)])
+    store_bytes(policy, c, b"cccc")
+    assert a.read_bytes() == b"aaaa"
+    assert not b.exists()
+    assert c.read_bytes() == b"cccc"
+    assert policy.accounted_bytes == 8
+    # The first file can be published before a later write fails.
+    now[0] += 11
+    policy.maintain()
+
+    def partial_write():
+        a.write_bytes(b"aaaa")
+        raise OSError(errno.EIO, "write failed")
+
+    with pytest.raises(OSError, match="write failed"):
+        policy.store([str(a), str(b)], 4, partial_write)
+    assert policy.accounted_bytes == 4
+    assert policy.contains(str(a))
+    assert not policy.contains(str(b))
+    store_bytes(policy, b, b"bbbb")
+    assert policy.accounted_bytes == 8
+
+
+def test_retention_reserves_concurrent_writes_before_io(retention, tmp_path):
+    policy, _ = retention
+    entered, release = threading.Event(), threading.Event()
+    a, b = tmp_path / "a.bin", tmp_path / "b.bin"
+
+    def pending_write():
+        entered.set()
+        assert release.wait(5)
+        a.write_bytes(b"12345678")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(policy.store, [str(a)], 8, pending_write)
+        try:
+            assert entered.wait(5)
+            assert policy.accounted_bytes == 8
+            assert not a.exists()
+            with pytest.raises(OSError) as error:
+                store_bytes(policy, b, b"bbbb")
+            assert error.value.errno == errno.ENOSPC
+            assert not b.exists()
+            with pytest.raises(OSError) as error:
+                store_bytes(policy, a, b"12345678")
+            assert error.value.errno == errno.EAGAIN
+            with pytest.raises(OSError) as error:
+                policy.load([str(a)], lambda: a.read_bytes())
+            assert error.value.errno == errno.EAGAIN
+        finally:
+            release.set()
+        future.result(timeout=5)
+    assert a.read_bytes() == b"12345678"
+    assert policy.accounted_bytes == 8
+
+
+def test_retention_pins_loads_and_refreshes_only_successful_reads(retention, tmp_path):
+    policy, now = retention
+    a, b = tmp_path / "a.bin", tmp_path / "b.bin"
+    store_bytes(policy, a, b"12345678")
+    entered, release = threading.Event(), threading.Event()
+
+    def pending_read():
+        entered.set()
+        assert release.wait(5)
+        assert a.read_bytes() == b"12345678"
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(policy.load, [str(a)], pending_read)
+        try:
+            assert entered.wait(5)
+            with pytest.raises(OSError) as error:
+                store_bytes(policy, a, b"12345678")
+            assert error.value.errno == errno.EAGAIN
+            now[0] += 11
+            policy.maintain()
+            assert a.exists()
+            with pytest.raises(OSError) as error:
+                store_bytes(policy, b, b"bbbb")
+            assert error.value.errno == errno.ENOSPC
+        finally:
+            release.set()
+        future.result(timeout=5)
+    assert policy.contains(str(a))
+    now[0] += 9
+
+    def failed_read():
+        raise OSError(errno.EIO, "read failed")
+
+    with pytest.raises(OSError, match="read failed"):
+        policy.load([str(a)], failed_read)
+    now[0] += 1
+    assert not policy.contains(str(a))
+    policy.maintain()
+    assert not a.exists()
+
+
+def test_retention_startup_cleans_crash_files_and_enforces_budget(tmp_path):
+    now = time.time()
+    for index in range(3):
+        path = tmp_path / f"{index}.bin"
+        path.write_bytes(b"data")
+        os.utime(path, (now - index, now - index))
+    abandoned = tmp_path / "abc.bin_123.tmp"
+    abandoned.write_bytes(b"partial")
+    unrelated = tmp_path / "keep.tmp"
+    unrelated.write_bytes(b"unrelated")
+    policy = FileRetention(str(tmp_path), 10, 8)
+    try:
+        assert not abandoned.exists()
+        assert unrelated.read_bytes() == b"unrelated"
+        assert not (tmp_path / "2.bin").exists()
+        assert policy.accounted_bytes == 8
+        with pytest.raises(RuntimeError, match="exclusive ownership"):
+            FileRetention(str(tmp_path), 10, 8)
+        with pytest.raises(RuntimeError, match="exclusive ownership"):
+            DirectoryLock(str(tmp_path), exclusive=False)
+    finally:
+        policy.close()
+    # Default, unbounded instances can still share with each other.
+    first = DirectoryLock(str(tmp_path), exclusive=False)
+    second = DirectoryLock(str(tmp_path), exclusive=False)
+    try:
+        with pytest.raises(RuntimeError, match="exclusive ownership"):
+            FileRetention(str(tmp_path), 10, 8)
+    finally:
+        second.close()
+        first.close()
+
+
+def test_fs_retention_budget_preserves_data_and_restarts(tmp_path):
+    """Exercise the real tier, worker queues and batched filesystem I/O."""
+    spec = CPUOffloadingSpec(make_offloading_config())
+    buffer = mmap.mmap(-1, mmap.PAGESIZE * 4)
+    view = memoryview(buffer).cast("B", shape=[4, mmap.PAGESIZE])
+    flat = view.cast("B")
+    flat[: mmap.PAGESIZE] = b"a" * mmap.PAGESIZE
+    flat[mmap.PAGESIZE : 2 * mmap.PAGESIZE] = b"b" * mmap.PAGESIZE
+    args = dict(
+        offloading_spec=spec,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        idle_ttl_seconds=3600,
+        max_bytes=mmap.PAGESIZE,
+    )
+    tier = FileSystemTierManager(**args)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert [result.success for result in drain(tier)] == [True]
+        first = Path(tier.file_mapper.get_file_name(key(1)))
+        assert first.read_bytes() == b"a" * mmap.PAGESIZE
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        assert [result.success for result in drain(tier)] == [True]
+        assert not first.exists()
+        assert tier.lookup(key(1), _CTX) is LookupResult.MISS
+        assert (
+            sum(path.stat().st_size for path in tmp_path.rglob("*.bin"))
+            <= mmap.PAGESIZE
+        )
+    finally:
+        tier.shutdown()
+    tier = FileSystemTierManager(**args)
+    try:
+        tier.submit_load(make_job(3, [key(2)], [2], is_promotion=True))
+        assert [result.success for result in drain(tier)] == [True]
+        actual = bytes(flat[2 * mmap.PAGESIZE : 3 * mmap.PAGESIZE])
+        assert actual == b"b" * mmap.PAGESIZE
+    finally:
+        tier.shutdown()
+        flat.release()
+        view.release()
+        buffer.close()
+
+
+def test_fs_retention_real_generation_reuses_then_expires(
+    tmp_path, vllm_runner, monkeypatch
+):
+    """A disk hit survives clearing faster tiers; expired data is recomputed."""
+    from vllm import SamplingParams, TokensPrompt
+    from vllm.config import KVTransferConfig
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    limit = 16 << 20
+    config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "cpu_bytes_to_use": 256 << 20,
+            "block_size": 64,
+            "spec_name": "TieringOffloadingSpec",
+            "secondary_tiers": [
+                {
+                    "type": "fs",
+                    "root_dir": str(tmp_path),
+                    "idle_ttl_seconds": 30,
+                    "max_bytes": limit,
+                }
+            ],
+        },
+    )
+    prompt = TokensPrompt(prompt_token_ids=list(range(100, 356)) + [7])
+    sampling = SamplingParams(temperature=0, max_tokens=1)
+    with vllm_runner(
+        "facebook/opt-125m",
+        max_model_len=1024,
+        gpu_memory_utilization=0.1,
+        enforce_eager=True,
+        kv_transfer_config=config,
+    ) as runner:
+        llm = runner.llm
+
+        def wait_for(condition, timeout=60):
+            deadline = time.monotonic() + timeout
+            while not condition():
+                assert time.monotonic() < deadline, "filesystem tier did not settle"
+                llm.llm_engine.step()
+                threading.Event().wait(0.02)
+
+        initial = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        wait_for(lambda: len(list(tmp_path.rglob("*.bin"))) >= 4)
+        paths = list(tmp_path.rglob("*.bin"))
+        assert sum(path.stat().st_size for path in paths) <= limit
+        latest = max(path.stat().st_mtime for path in paths)
+
+        # This repeat stays in GPU memory. It must still refresh disk lifetime.
+        gpu_hit = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        assert gpu_hit.num_cached_tokens == 256
+        wait_for(lambda: all(path.stat().st_mtime > latest for path in paths))
+
+        # Clearing only GPU KV leaves the primary CPU copies available.
+        latest = max(path.stat().st_mtime for path in paths)
+        assert llm.reset_prefix_cache()
+        cpu_hit = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        assert cpu_hit.num_cached_tokens == 256
+        assert cpu_hit.outputs[0].token_ids == initial.outputs[0].token_ids
+        wait_for(lambda: all(path.stat().st_mtime > latest for path in paths))
+
+        assert llm.reset_prefix_cache(reset_connector=True)
+        llm.llm_engine.step()
+        disk_hit = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        assert disk_hit.num_cached_tokens == 256
+        assert disk_hit.outputs[0].token_ids == initial.outputs[0].token_ids
+
+        wait_for(lambda: not list(tmp_path.rglob("*.bin")), timeout=35)
+        assert llm.reset_prefix_cache(reset_connector=True)
+        llm.llm_engine.step()
+        expired = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        assert expired.num_cached_tokens == 0
+        assert expired.outputs[0].token_ids == initial.outputs[0].token_ids
+
+
+def test_retention_duplicate_store_refreshes_without_rewriting(retention, tmp_path):
+    policy, now = retention
+    path = tmp_path / "a.bin"
+    store_bytes(policy, path, b"data")
+    now[0] += 9
+    # The real batch writer also returns immediately for an existing block.
+    policy.store([str(path)], 4, lambda: None)
+    now[0] += 9
+    assert policy.contains(str(path))
+    assert policy.accounted_bytes == 4
+    assert path.read_bytes() == b"data"
+    now[0] += 1
+    policy.maintain()
+    assert not path.exists()
+
+
+def test_retention_accounts_abandoned_temporary_write(retention, tmp_path):
+    from vllm.v1.kv_offload.tiering.fs.io import _get_tmp_suffix
+
+    policy, _ = retention
+    path = tmp_path / "a.bin"
+    temporary = Path(str(path) + _get_tmp_suffix())
+
+    def failed_write():
+        temporary.write_bytes(b"part")
+        raise OSError(errno.EIO, "publication and cleanup failed")
+
+    with pytest.raises(OSError, match="publication and cleanup failed"):
+        policy.store([str(path)], 8, failed_write)
+    assert policy.accounted_bytes == 4
+    assert not policy.contains(str(path))
+    policy.maintain()
+    assert not temporary.exists()
+    assert policy.accounted_bytes == 0
+
+
+@pytest.mark.parametrize("ttl,limit", [(0, 8), (float("nan"), 8), (10, 0), (10, 1.5)])
+def test_retention_rejects_invalid_limits_without_holding_directory(
+    tmp_path, ttl, limit
+):
+    with pytest.raises(ValueError):
+        FileRetention(str(tmp_path), ttl, limit)
+    owner = DirectoryLock(str(tmp_path), exclusive=True)
+    owner.close()
+
+
+def test_retention_does_not_reuse_corrupt_size_for_write_reservation(tmp_path):
+    path = tmp_path / "a.bin"
+    path.write_bytes(b"bad")
+    policy = FileRetention(str(tmp_path), 10, 8)
+    try:
+        with pytest.raises(OSError, match="invalid size"):
+            store_bytes(policy, path, b"12345678")
+        assert policy.accounted_bytes == 3
+        assert not policy.contains(str(path))
+        policy.maintain()
+        store_bytes(policy, path, b"12345678")
+        assert policy.accounted_bytes == 8
+        assert path.read_bytes() == b"12345678"
+    finally:
+        policy.close()

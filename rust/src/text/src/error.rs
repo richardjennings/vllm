@@ -52,6 +52,8 @@ pub enum Error {
     MinTokensExceedsMaxTokens { min_tokens: u32, max_tokens: u32 },
     #[error("`thinking_token_budget` must be a non-negative integer or -1 for unlimited.")]
     InvalidThinkingTokenBudget,
+    #[error("`thinking_token_budget_cumulative` requires `thinking_token_budget`.")]
+    CumulativeThinkingRequiresBudget,
     #[error(
         "truncate_prompt_tokens={value} cannot be greater than max_model_len = \
          {max_model_len}. Please request a smaller truncation size."
@@ -88,6 +90,7 @@ impl Error {
             | Self::SamplingParams(_)
             | Self::MinTokensExceedsMaxTokens { .. }
             | Self::InvalidThinkingTokenBudget
+            | Self::CumulativeThinkingRequiresBudget
             | Self::TruncatePromptTokensExceedsMaxModelLen { .. }
             | Self::InvalidTruncatePromptTokens { .. }
             | Self::TruncateUnsupportedWithMultimodal

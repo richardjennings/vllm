@@ -810,6 +810,15 @@ class TieringOffloadingManager(OffloadingManager):
 
         """
         self.primary_tier.complete_load(keys, req_context)
+        for tier in self.secondary_tiers:
+            tier.touch(keys, req_context)
+
+    @override
+    def on_gpu_prefix_hit(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        for tier in self.secondary_tiers:
+            tier.touch(keys, req_context)
 
     @override
     def prepare_store(

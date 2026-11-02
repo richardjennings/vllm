@@ -13,16 +13,21 @@ RTX PRO 6000 Blackwell GPUs (SM120), with its Engram tables read from disk:
 
 ## Image
 
-The pull requests change Python files only. The image is vLLM's official image
-of the base commit, pinned by digest in `base.env`, with the Python files this
-branch changes copied over the installed package. `build-context.sh` stages
-those files. It fails for any change a file copy cannot carry, such as a
-deleted or renamed file, or a change outside `vllm/*.py` other than tests, docs
-and these build files. Such a change needs a full image build.
+The image reuses vLLM's official CUDA artifacts from the base commit, pinned by
+digest in `base.env`. Changed Python files are copied over the installed
+package, and the bundled Rust frontend is rebuilt from this branch so request
+fields have the same behavior through either frontend. The Rust build uses the
+same package and `native-tls-vendored` feature as `tools/build_rust.py`.
+
+`build-context.sh` stages the Python overlay and complete Rust build inputs.
+Deleted or renamed Python files, CUDA/C++ changes, and other runtime inputs it
+cannot carry still fail staging and require a full image build. Tests, docs,
+Buildkite configuration and these build files do not alter the runtime overlay.
 
 On each push to a branch that contains it,
 [overlay-image.yml](../.github/workflows/overlay-image.yml) builds the image and
-pushes it as `ghcr.io/richardjennings/vllm:<branch>-<commit>`.
+pushes it as `ghcr.io/richardjennings/vllm:<branch>-<commit>` (branch slashes are
+replaced with hyphens).
 
 ## Moving to a newer vLLM
 

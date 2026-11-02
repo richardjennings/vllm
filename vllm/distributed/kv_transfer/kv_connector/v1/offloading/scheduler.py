@@ -1297,6 +1297,15 @@ class OffloadingConnectorScheduler:
 
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
+        # GPU prefix hits bypass offload loads, but still reuse the disk copies.
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            num_chunks = num_computed_tokens // group_config.tokens_per_chunk
+            if num_chunks:
+                self.manager.on_gpu_prefix_hit(
+                    group_state.offload_keys[:num_chunks], req_status.req_context
+                )
 
         num_hit_tokens: int | None
         if request.skip_reading_external_kv:

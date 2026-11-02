@@ -116,6 +116,7 @@ pub fn lower_sampling_params(
         max_tokens,
         min_tokens,
         thinking_token_budget,
+        thinking_token_budget_cumulative,
         logprobs,
         prompt_logprobs,
         prompt_logprob_token_ids,
@@ -191,6 +192,9 @@ pub fn lower_sampling_params(
         });
     }
     let thinking_token_budget = normalize_thinking_token_budget(thinking_token_budget)?;
+    if thinking_token_budget_cumulative && thinking_token_budget.is_none() {
+        return Err(Error::CumulativeThinkingRequiresBudget);
+    }
 
     let mut stop_token_ids = stop_token_ids.unwrap_or_default();
     let mut all_stop_token_ids = BTreeSet::from_iter(stop_token_ids.iter().copied());
@@ -217,6 +221,7 @@ pub fn lower_sampling_params(
         max_tokens,
         min_tokens,
         thinking_token_budget,
+        thinking_token_budget_cumulative,
         logprobs,
         prompt_logprobs,
         prompt_logprob_token_ids: lower_prompt_logprob_token_ids(
@@ -531,6 +536,29 @@ mod tests {
             lower(Some(-2)),
             Err(Error::InvalidThinkingTokenBudget)
         ));
+    }
+
+    #[test]
+    fn cumulative_thinking_requires_and_preserves_a_finite_budget() {
+        for budget in [None, Some(-1), Some(0), Some(5)] {
+            let result = lower_sampling_params_with_limits(
+                SamplingParams {
+                    thinking_token_budget: budget,
+                    thinking_token_budget_cumulative: true,
+                    ..SamplingParams::default()
+                },
+                sample_sampling_limits(),
+            );
+            if matches!(budget, None | Some(-1)) {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::CumulativeThinkingRequiresBudget));
+                assert!(error.is_request_validation_error());
+            } else {
+                let result = result.unwrap();
+                assert!(result.thinking_token_budget_cumulative);
+                assert_eq!(result.thinking_token_budget, budget.map(|b| b as u64));
+            }
+        }
     }
 
     #[test]

@@ -95,6 +95,8 @@ pub struct EngineCoreSamplingParams {
     /// reaching this DTO, so only non-negative values are sent. Enforced
     /// engine-side (and only when a reasoning parser is configured).
     pub thinking_token_budget: Option<u64>,
+    /// Share the allowance across reasoning blocks in one response.
+    pub thinking_token_budget_cumulative: bool,
     /// Number of log probabilities to return per generated token.
     ///
     /// `None` disables sample logprobs. `-1` requests the full vocabulary.
@@ -181,6 +183,7 @@ impl EngineCoreSamplingParams {
             max_tokens: 65536,
             min_tokens: 0,
             thinking_token_budget: None,
+            thinking_token_budget_cumulative: false,
             logprobs: None,
             prompt_logprobs: None,
             prompt_logprob_token_ids: None,

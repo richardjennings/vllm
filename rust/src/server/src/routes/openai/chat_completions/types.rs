@@ -192,6 +192,9 @@ pub struct ChatCompletionRequest {
     /// `-1` for unlimited (mirroring the Python frontend, which normalizes `-1`
     /// to "no budget").
     pub thinking_token_budget: Option<i64>,
+    /// Share the thinking allowance across all reasoning blocks in the response.
+    #[serde(default)]
+    pub thinking_token_budget_cumulative: bool,
 
     /// Whether to include reasoning content in the response
     #[serde(default = "default_true")]
@@ -308,6 +311,7 @@ impl Default for ChatCompletionRequest {
             tool_choice: None,
             reasoning_effort: None,
             thinking_token_budget: None,
+            thinking_token_budget_cumulative: false,
             include_reasoning: true,
             parallel_tool_calls: None,
             user: None,

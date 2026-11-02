@@ -14,10 +14,11 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
 """
 
+import contextlib
 import functools
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -54,6 +55,7 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     batch_store_block,
     probe_o_direct,
 )
+from vllm.v1.kv_offload.tiering.fs.retention import DirectoryLock, FileRetention
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -77,6 +79,8 @@ class FsAsyncLookupManager(AsyncLookupManager):
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
+        if self._tier._retention is not None:
+            return [self._tier._retention.contains(path) for path in paths]
         if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
             return batch_lookup_C(paths)
@@ -117,6 +121,8 @@ class FileSystemTierManager(SecondaryTierManager):
         enable_kv_events: bool = False,
         locality: str | None = None,
         backpressure_detector: BackpressureDetector | None = None,
+        idle_ttl_seconds: float | None = None,
+        max_bytes: int | None = None,
     ):
         """Args:
         offloading_spec: Contains normalized offloading configuration and
@@ -132,6 +138,10 @@ class FileSystemTierManager(SecondaryTierManager):
         locality: Whether this tier's storage is LOCAL or REMOTE relative
             to the publishing vLLM instance.
         backpressure_detector: Optional backpressure detector.
+        idle_ttl_seconds: Expire disk blocks this many seconds after last reuse.
+            Requires max_bytes and exclusive ownership of root_dir.
+        max_bytes: Maximum total block bytes, including reserved writes.
+            Requires idle_ttl_seconds.
 
         """
         super().__init__(
@@ -179,34 +189,47 @@ class FileSystemTierManager(SecondaryTierManager):
             parallel_agnostic=True,
         )
 
-        # Write config file
-        config_path = self.file_mapper.get_config_file_path()
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        if not os.path.exists(config_path):
-            with open(config_path, "w") as f:
-                json.dump(
-                    self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
+        if (idle_ttl_seconds is None) != (max_bytes is None):
+            raise ValueError("idle_ttl_seconds and max_bytes must be set together")
+        self._retention: FileRetention | None = None
+        with contextlib.ExitStack() as cleanup:
+            if idle_ttl_seconds is not None and max_bytes is not None:
+                self._retention = FileRetention(root_dir, idle_ttl_seconds, max_bytes)
+                self._directory_owner: DirectoryLock | FileRetention = self._retention
+            else:
+                self._directory_owner = DirectoryLock(root_dir, exclusive=False)
+            cleanup.callback(self._directory_owner.close)
+
+            config_path = self.file_mapper.get_config_file_path()
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            if not os.path.exists(config_path):
+                with open(config_path, "w") as f:
+                    json.dump(
+                        self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
+                    )
+
+            self._use_o_direct = probe_o_direct(os.path.dirname(config_path))
+            if not self._use_o_direct:
+                logger.warning(
+                    "O_DIRECT is not supported at '%s'; falling back to buffered "
+                    "I/O for the '%s' KV offload tier.",
+                    root_dir,
+                    tier_type,
                 )
 
-        # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
-        # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
-        # rather than failing every block.
-        self._use_o_direct = probe_o_direct(os.path.dirname(config_path))
-        if not self._use_o_direct:
-            logger.warning(
-                "O_DIRECT is not supported at '%s'; falling back to buffered "
-                "I/O for the '%s' KV offload tier.",
-                root_dir,
-                tier_type,
+            self._pool = DualQueueThreadPool(
+                n_read_threads,
+                n_write_threads,
+                thread_name_prefix="vllm_kv_py_fs",
             )
-
-        self._pool = DualQueueThreadPool(
-            n_read_threads,
-            n_write_threads,
-            thread_name_prefix="vllm_kv_py_fs",
-        )
-
-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+            cleanup.callback(self._pool.shutdown, wait=True)
+            self._lookup_manager = FsAsyncLookupManager(
+                tier=self, tier_type=self.tier_type
+            )
+            cleanup.callback(self._lookup_manager.shutdown)
+            if self._retention is not None:
+                self._retention.start()
+            cleanup.pop_all()
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -214,24 +237,39 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        # Cached async lookup verdicts must not resurrect evicted/expired data.
+        if self._retention is not None and not self._retention.contains(
+            self.file_mapper.get_file_name(key)
+        ):
+            return LookupResult.MISS
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
     @override
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        if self._retention is not None:
+            self._retention.touch(self.file_mapper.get_file_name(key) for key in keys)
+
+    @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
         task = functools.partial(
             batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in keys],
+            paths,
             self._primary_kv_view,
             [int(cid) * self._block_size for cid in job_metadata.chunk_ids],
             self._block_size,
             self._use_o_direct,
         )
+        if self._retention is not None:
+            task = functools.partial(
+                self._retention.store, paths, self._block_size, task
+            )
         self._job_block_counts[job_metadata.job_id] = len(keys)
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
 
@@ -245,16 +283,20 @@ class FileSystemTierManager(SecondaryTierManager):
         self._job_block_counts[job_id] = len(keys)
         paths = [self.file_mapper.get_file_name(key) for key in keys]
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
+        read = functools.partial(
+            batch_load_block,
+            paths,
+            self._primary_kv_view,
+            offsets,
+            self._block_size,
+            self._use_o_direct,
+        )
+        if self._retention is not None:
+            read = functools.partial(self._retention.load, paths, read)
 
         def load_task() -> None:
             try:
-                batch_load_block(
-                    paths,
-                    self._primary_kv_view,
-                    offsets,
-                    self._block_size,
-                    self._use_o_direct,
-                )
+                read()
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
                 # before the failure so get_finished_jobs can keep them; this
@@ -351,3 +393,4 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
+        self._directory_owner.close()

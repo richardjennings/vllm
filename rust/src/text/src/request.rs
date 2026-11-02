@@ -92,6 +92,8 @@ pub struct SamplingParams {
     /// here; `-1` is normalized to `None` (and other negatives rejected) during
     /// lowering (see `lower_sampling_params`).
     pub thinking_token_budget: Option<i64>,
+    /// Share the allowance across reasoning blocks in one response.
+    pub thinking_token_budget_cumulative: bool,
     /// Number of log probabilities to return per generated token.
     ///
     /// `None` disables sample logprobs. `-1` requests the full vocabulary.
@@ -176,6 +178,7 @@ impl Default for SamplingParams {
             max_tokens: None,
             min_tokens: None,
             thinking_token_budget: None,
+            thinking_token_budget_cumulative: false,
             logprobs: None,
             prompt_logprobs: None,
             prompt_logprob_token_ids: None,

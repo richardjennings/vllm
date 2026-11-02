@@ -311,3 +311,126 @@ def test_v2_thinking_budget_continues_end_prefix_from_prompt():
 
     assert out[0, END_B] == pytest.approx(1.0e9)
     assert out[0, END_A] == 0
+
+
+@pytest.mark.parametrize("cumulative", [False, True])
+def test_v2_cumulative_budget_carries_across_blocks_and_speculation(cumulative):
+    from vllm.config import ModelConfig, ReasoningConfig
+
+    config = ReasoningConfig(
+        reasoning_start_str="<think>", reasoning_end_str="</think>"
+    )
+    config.initialize_token_ids(
+        ModelConfig(model="Qwen/Qwen3-0.6B", max_model_len=2048)
+    )
+    start, end = config.reasoning_start_token_ids, config.reasoning_end_token_ids
+    assert start and end and len(start) == len(end) == 1
+    vocab_size = max(start + end) + 1
+    states = RequestState(
+        max_num_reqs=4,
+        max_model_len=64,
+        max_num_batched_tokens=16,
+        num_speculative_steps=4,
+        vocab_size=vocab_size,
+        device=DEVICE,
+    )
+    # The prompt's completed reasoning does not spend this response's budget.
+    prompt = start + [19] * 6 + end + start
+    states.add_request(
+        req_id="cumulative",
+        prompt_len=len(prompt),
+        all_token_ids=prompt,
+        num_computed_tokens=len(prompt),
+        max_tokens=32,
+    )
+    states.apply_staged_writes()
+    state = ThinkingBudgetState(states, config)
+    state.add_request(
+        3,
+        SamplingParams(
+            thinking_token_budget=5, thinking_token_budget_cumulative=cumulative
+        ),
+    )
+    state.apply_staged_writes()
+    _apply(state, torch.zeros((1, vocab_size), device=DEVICE), [start[0]], [0])
+    accepted = [10, 11] + end + start + [12]
+    states.all_token_ids.stage_write(3, len(prompt), accepted)
+    states.total_len.stage_write_elem(3, len(prompt) + len(accepted))
+    states.apply_staged_writes()
+    out = _apply(
+        state,
+        torch.zeros((4, vocab_size), device=DEVICE),
+        [12, 13, 14, 15],
+        [0, 1, 2, 3],
+    )
+    assert torch.nonzero(out, as_tuple=False).tolist() == (
+        [[2, end[0]], [3, end[0]]] if cumulative else []
+    )
+    # Rejected proposals must not spend allowance or double-count prior blocks.
+    again = _apply(state, torch.zeros((2, vocab_size), device=DEVICE), [12, 16], [0, 1])
+    assert torch.count_nonzero(again).item() == 0
+    # A cold scan after re-admission reconstructs all accepted response blocks.
+    state.add_request(
+        3,
+        SamplingParams(
+            thinking_token_budget=5, thinking_token_budget_cumulative=cumulative
+        ),
+    )
+    state.apply_staged_writes()
+    rebuilt = _apply(
+        state,
+        torch.zeros((4, vocab_size), device=DEVICE),
+        [12, 13, 14, 15],
+        [0, 1, 2, 3],
+    )
+    torch.testing.assert_close(out, rebuilt)
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+def test_v2_cumulative_budget_counts_repeated_open_marker(speculative):
+    from vllm.config import ModelConfig, ReasoningConfig
+
+    config = ReasoningConfig(
+        reasoning_start_str="<think>", reasoning_end_str="</think>"
+    )
+    config.initialize_token_ids(
+        ModelConfig(model="Qwen/Qwen3-0.6B", max_model_len=2048)
+    )
+    start, end = config.reasoning_start_token_ids, config.reasoning_end_token_ids
+    assert start and end and len(start) == len(end) == 1
+    vocab_size = max(start + end) + 1
+    states = RequestState(
+        max_num_reqs=4,
+        max_model_len=64,
+        max_num_batched_tokens=16,
+        num_speculative_steps=4,
+        vocab_size=vocab_size,
+        device=DEVICE,
+    )
+    # A second opening marker inside an already open block is reasoning text;
+    # it must not reset the allowance. Check accepted and proposed tokens.
+    accepted = start + [10]
+    if not speculative:
+        accepted += start + [11]
+    states.add_request(
+        req_id="repeated-open",
+        prompt_len=1,
+        all_token_ids=accepted,
+        num_computed_tokens=len(accepted),
+        max_tokens=32,
+    )
+    states.apply_staged_writes()
+    state = ThinkingBudgetState(states, config)
+    state.add_request(
+        3,
+        SamplingParams(thinking_token_budget=3, thinking_token_budget_cumulative=True),
+    )
+    state.apply_staged_writes()
+    inputs = [10, start[0], 11] if speculative else [11]
+    out = _apply(
+        state,
+        torch.zeros((len(inputs), vocab_size), device=DEVICE),
+        inputs,
+        list(range(len(inputs))),
+    )
+    assert torch.nonzero(out, as_tuple=False).tolist() == [[len(inputs) - 1, end[0]]]

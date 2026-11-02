@@ -275,6 +275,16 @@ To use this feature:
 
 If `thinking_token_budget` is not specified, no explicit reasoning limit is applied beyond normal generation constraints such as `max_tokens`.
 
+By default, each reasoning block receives a fresh allowance. Set
+`thinking_token_budget_cumulative=true` together with `thinking_token_budget`
+in a Chat Completions request (or `SamplingParams`) to share one allowance
+across all reasoning blocks in that response. For example, with a budget of
+500, a first block using 200 reasoning tokens leaves at most 300 for later
+blocks. Boundary markers and visible answer text do not spend the allowance.
+An open reasoning suffix in the prompt counts toward the budget; completed
+reasoning in earlier messages does not. Speculative proposals only spend the
+allowance once accepted. This mode is disabled by default.
+
 `--reasoning-config` accepts a JSON object corresponding to  
 [ReasoningConfig][vllm.config.ReasoningConfig] with the following fields:
 

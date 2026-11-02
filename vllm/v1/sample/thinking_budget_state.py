@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-batch thinking token budget state; applied after penalties at sample time."""
 
+from copy import copy
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -29,6 +30,61 @@ def maybe_create_thinking_budget_state_holder(
     return ThinkingBudgetStateHolder(
         reasoning_config, max_num_seqs, num_spec_tokens, device, is_pin_memory
     )
+
+
+class CumulativeThinkingBudget:
+    """Count accepted reasoning tokens across blocks; forecast draft masks on a copy."""
+
+    def __init__(
+        self,
+        start: list[int],
+        end: list[int],
+        budget: int,
+        natural_end: list[int] | None = None,
+    ):
+        if not start or not end:
+            raise ValueError("Cumulative thinking requires reasoning boundaries")
+        self.start = tuple(start)
+        self.end = tuple(end)
+        self.ends = (self.end, tuple(natural_end or end))
+        self.remaining = budget
+        self.in_think = False
+        self.pending: tuple[int, ...] = ()
+
+    def accept(self, token: int) -> None:
+        boundaries = self.ends if self.in_think else (self.start,)
+        self.pending += (token,)
+        while self.pending and not any(
+            self.pending == boundary[: len(self.pending)] for boundary in boundaries
+        ):
+            self.pending = self.pending[1:]
+            if self.in_think:
+                self.remaining -= 1
+        if self.pending in boundaries:
+            self.in_think = not self.in_think
+            self.pending = ()
+
+    def forced_token(self) -> int | None:
+        # A pending end-marker prefix is not reasoning. If abandoning that
+        # prefix could exceed the remaining budget, require its continuation.
+        if self.in_think and self.remaining <= len(self.pending):
+            for boundary in self.ends:
+                if self.pending == boundary[: len(self.pending)]:
+                    return boundary[len(self.pending)]
+        return None
+
+    def forecast(self, drafts: list[int]) -> list[tuple[int, int]]:
+        view = copy(self)
+        forced = []
+        for position in range(len(drafts) + 1):
+            token = view.forced_token()
+            if token is not None:
+                forced.append((position, token))
+            if position < len(drafts):
+                # A mismatching draft is rejected here; later positions on
+                # that path cannot be accepted. The live budget is untouched.
+                view.accept(drafts[position] if token is None else token)
+        return forced
 
 
 class ThinkingBudgetStateHolder:
@@ -63,6 +119,11 @@ class ThinkingBudgetStateHolder:
             self.think_end_token_ids = re if re else []
 
         self.device = device
+        self.natural_think_end_token_ids = (
+            reasoning_config.natural_reasoning_end_token_ids or self.think_end_token_ids
+            if reasoning_config is not None
+            else []
+        )
         self._state: dict[int, dict[str, Any]] = {}
         self.cu_num_tokens: dict[int, int] = {}
 
@@ -95,6 +156,34 @@ class ThinkingBudgetStateHolder:
                 )
                 self._state[index]["output_tok_ids"] = output_tok_ids
                 self._state[index]["spec_token_ids"] = []
+                if params.thinking_token_budget_cumulative:
+                    tracker = CumulativeThinkingBudget(
+                        self.think_start_token_ids,
+                        self.think_end_token_ids,
+                        thinking_token_budget,
+                        self.natural_think_end_token_ids,
+                    )
+                    # Only an open reasoning suffix belongs to this response;
+                    # completed thinking in earlier messages does not count.
+                    prompt = prompt_tok_ids or []
+                    start = self._find_last_sequence_index(
+                        prompt, self.think_start_token_ids
+                    )
+                    end = self._find_last_sequence_index(
+                        prompt, self.think_end_token_ids
+                    )
+                    end = max(
+                        end,
+                        self._find_last_sequence_index(
+                            prompt, self.natural_think_end_token_ids
+                        ),
+                    )
+                    if start > end:
+                        for token in prompt[start:]:
+                            tracker.accept(token)
+                    self._state[index]["cumulative_initial"] = copy(tracker)
+                    self._state[index]["cumulative_budget"] = tracker
+                    self._state[index]["cumulative_output_length"] = 0
             else:
                 self._state.pop(index, None)
 
@@ -228,6 +317,18 @@ class ThinkingBudgetStateHolder:
         }
 
     def _update_think_state(self, state: dict[str, Any]) -> None:
+        if "cumulative_budget" in state:
+            output = state["output_tok_ids"]
+            previous = state["cumulative_output_length"]
+            if len(output) < previous:
+                state["cumulative_budget"] = copy(state["cumulative_initial"])
+                previous = 0
+            tracker = state["cumulative_budget"]
+            for token in output[previous:]:
+                tracker.accept(token)
+            state["cumulative_output_length"] = len(output)
+            state["cumulative_forced"] = tracker.forecast(state["spec_token_ids"])
+            return
         if state.get("thinking_token_budget", -1) == -1:
             return
         if len(self.think_end_token_ids) == 0:
@@ -511,6 +612,20 @@ class ThinkingBudgetStateHolder:
             if seq_idx not in self.cu_num_tokens:
                 continue
             state = self._state[seq_idx]
+            if "cumulative_budget" in state:
+                draft_count = len(state["spec_token_ids"])
+                for position, token in state.get("cumulative_forced", []):
+                    if predict_bonus_token:
+                        if position != draft_count:
+                            continue
+                        position = 0
+                    elif self.in_spec_mode and position == draft_count:
+                        continue
+                    row = self.cu_num_tokens[seq_idx] + position
+                    if row < self._mask_capacity and row < logits.shape[0]:
+                        active_indices_cpu.append(row)
+                        force_tokens_cpu.append(token)
+                continue
             if state.get("in_end", False):
                 # logits processor in spec mode are called twice
                 # once for bonus token logits and
