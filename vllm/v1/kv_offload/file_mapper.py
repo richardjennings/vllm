@@ -38,6 +38,7 @@ class FileMapper:
         parallel_agnostic: bool = False,
         replicated_layout: bool = False,
         canonical_format: str | None = None,
+        namespace: str | None = None,
     ):
         """Initialize the file mapper. Each worker constructs its own, but
         `config.json` is shared across workers since rank lives outside the hash.
@@ -71,6 +72,10 @@ class FileMapper:
         # identity participates in the storage namespace.
         if canonical_format is not None:
             self.fields["canonical_format"] = canonical_format
+        if namespace is not None:
+            if not isinstance(namespace, str) or not namespace.strip():
+                raise ValueError("namespace must be a nonempty string")
+            self.fields["namespace"] = namespace
         self.base_path: str = self._compute_base_path(root_dir, self.fields)
 
     @classmethod
@@ -80,6 +85,7 @@ class FileMapper:
         offloading_spec: OffloadingSpec,
         blocks_per_file: int = 1,
         parallel_agnostic: bool = False,
+        namespace: str | None = None,
     ) -> "FileMapper":
         """Build a FileMapper from an OffloadingSpec."""
         config = offloading_spec.config
@@ -113,6 +119,7 @@ class FileMapper:
             ),
             replicated_layout=(parallel_agnostic and config.replicated_layout),
             canonical_format=canonical_format,
+            namespace=namespace,
         )
 
     def get_file_name(self, key: OffloadKey) -> str:

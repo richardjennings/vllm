@@ -123,6 +123,7 @@ class FileSystemTierManager(SecondaryTierManager):
         backpressure_detector: BackpressureDetector | None = None,
         idle_ttl_seconds: float | None = None,
         max_bytes: int | None = None,
+        namespace: str | None = None,
     ):
         """Args:
         offloading_spec: Contains normalized offloading configuration and
@@ -142,6 +143,8 @@ class FileSystemTierManager(SecondaryTierManager):
             Requires max_bytes and exclusive ownership of root_dir.
         max_bytes: Maximum total block bytes, including reserved writes.
             Requires idle_ttl_seconds.
+        namespace: Deployment compatibility identity, included in the storage
+            hash. All namespaces share root_dir's retention and ownership.
 
         """
         super().__init__(
@@ -187,6 +190,7 @@ class FileSystemTierManager(SecondaryTierManager):
             offloading_spec=offloading_spec,
             blocks_per_file=offloading_spec.blocks_per_chunk,
             parallel_agnostic=True,
+            namespace=namespace,
         )
 
         if (idle_ttl_seconds is None) != (max_bytes is None):

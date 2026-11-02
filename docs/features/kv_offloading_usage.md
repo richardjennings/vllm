@@ -238,6 +238,7 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | --- | --- | --- | --- |
 | `type` | yes | — | Must be `fs`. |
 | `root_dir` | yes | — | Base directory; vLLM creates subdirectories beneath it (see [On-Disk Layout](#on-disk-layout)). |
+| `namespace` | no | unset | Nonempty compatibility identity included in the storage hash. Use immutable weights, tokenizer/template and serving-image identities when files or code can change without changing the model name. |
 | `n_read_threads` | no | `16` | Read-priority I/O threads (load path). |
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
 | `idle_ttl_seconds` | no | disabled | Positive idle lifetime in seconds, measured from last KV reuse. Set together with `max_bytes`. Requires exclusive ownership of `root_dir`. |
@@ -250,6 +251,8 @@ Each thread group prefers its own queue but pulls from the other when its primar
 #### Idle expiry and disk budget
 
 For example, add `"idle_ttl_seconds": 10800, "max_bytes": 107374182400` to the FS tier configuration for a three-hour idle lifetime and a 100 GiB block budget. Use `7200` for two hours. These settings apply to every model/configuration namespace beneath `root_dir`.
+
+Keep `root_dir` stable across deployments and change `namespace` when compatibility changes. A replacement then misses incompatible blocks, while their files remain subject to the same idle expiry and disk budget. The namespace is a deployment identity, not a client or session identity; clients can still share compatible prefixes. Leaving it unset preserves existing storage paths.
 
 Reuse from GPU, CPU or disk refreshes the lifetime of the corresponding disk blocks. Merely checking whether a block exists does not refresh it. Expired blocks are misses immediately. Background maintenance runs at a one-second interval (or the TTL, if shorter); physical deletion can wait for active I/O or filesystem operations. Loads pin their blocks against eviction. Writes reserve their maximum size before starting and evict least recently used, unpinned blocks when needed. A batch that cannot fit is not offloaded; generation can continue using the ordinary cache-miss/recomputation path.
 

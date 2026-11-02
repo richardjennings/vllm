@@ -1230,6 +1230,48 @@ def test_retention_startup_cleans_crash_files_and_enforces_budget(tmp_path):
         first.close()
 
 
+def test_fs_namespace_isolates_versions_with_one_disk_budget(tmp_path):
+    """A replacement cannot load stale KV, but must account for its disk space."""
+    spec = CPUOffloadingSpec(make_offloading_config())
+    buffer = mmap.mmap(-1, mmap.PAGESIZE)
+    view = memoryview(buffer).cast("B", shape=[1, mmap.PAGESIZE])
+    try:
+        for namespace, expected_hit in [
+            ("weights-a/image-a", False),
+            ("weights-a/image-a", True),
+            ("weights-a/image-b", False),
+            ("weights-a/image-a", False),
+        ]:
+            tier = SecondaryTierFactory.create_secondary_tier(
+                {
+                    "type": "fs",
+                    "root_dir": str(tmp_path),
+                    "namespace": namespace,
+                    "idle_ttl_seconds": 3600,
+                    "n_read_threads": 1,
+                    "n_write_threads": 1,
+                    "max_bytes": mmap.PAGESIZE,
+                },
+                view,
+                spec,
+            )
+            try:
+                assert lookup_and_wait(tier, [key(1)]) == [
+                    LookupResult.HIT if expected_hit else LookupResult.MISS
+                ]
+                tier.submit_store(make_job(1, [key(1)], [0]))
+                assert [result.success for result in drain(tier)] == [True]
+                assert (
+                    sum(p.stat().st_size for p in tmp_path.rglob("*.bin"))
+                    == mmap.PAGESIZE
+                )
+            finally:
+                tier.shutdown()
+    finally:
+        view.release()
+        buffer.close()
+
+
 def test_fs_retention_budget_preserves_data_and_restarts(tmp_path):
     """Exercise the real tier, worker queues and batched filesystem I/O."""
     spec = CPUOffloadingSpec(make_offloading_config())
