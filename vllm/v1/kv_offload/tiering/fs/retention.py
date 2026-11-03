@@ -12,7 +12,8 @@ import stat
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from vllm.v1.kv_offload.tiering.fs.io import _get_tmp_suffix
@@ -250,6 +251,29 @@ class FileRetention:
                     self._reserved -= reservation
                     self._writers.difference_update(unique)
 
+    @contextmanager
+    def pin(self, paths: Iterable[str]) -> Iterator[None]:
+        """Protect a whole restore from TTL/quota eviction across small batches."""
+        unique = set(paths)
+        with self._lock:
+            now = self._clock()
+            if unique & self._writers or any(
+                (entry := self._entries.get(path)) is None
+                or now - entry.last_use >= self._ttl
+                for path in unique
+            ):
+                raise FileNotFoundError(
+                    errno.ENOENT, "KV block unavailable for restore"
+                )
+            for path in unique:
+                self._entries[path].pins += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                for path in unique:
+                    self._entries[path].pins -= 1
+
     def load(self, paths: list[str], read: Callable[[], None]) -> None:
         """Pin a batch against eviction and refresh successfully read blocks."""
         unique = set(paths)
@@ -259,7 +283,7 @@ class FileRetention:
             now = self._clock()
             if any(
                 (entry := self._entries.get(path)) is None
-                or now - entry.last_use >= self._ttl
+                or (not entry.pins and now - entry.last_use >= self._ttl)
                 for path in unique
             ):
                 raise FileNotFoundError(errno.ENOENT, "KV block expired or evicted")

@@ -317,6 +317,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
 
+        self.batched_loads = self.extra_config.get("batched_loads", False)
+        if type(self.batched_loads) is not bool:
+            raise ValueError("batched_loads must be a boolean")
+        if self.batched_loads and (
+            self.num_chunks < 1
+            or not self.secondary_tier_configs
+            or any(tier.get("type") != "fs" for tier in self.secondary_tier_configs)
+        ):
+            raise ValueError(
+                "batched_loads requires filesystem tiers and at least one CPU chunk"
+            )
+
         # Pause between tier-poll rounds for tiers that need servicing
         # between engine steps. Zero or negative disables the thread, which
         # restores per-step servicing.
@@ -426,6 +438,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     primary_tier=primary_tier,
                     secondary_tiers=secondary_tiers,
                     tier_poll_interval_s=self.tier_poll_interval_s,
+                    batched_loads=self.batched_loads,
                 )
                 self._manager = tiering_manager
             except Exception:

@@ -6,6 +6,7 @@ from dataclasses import replace
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     derive_canonical_mappings,
 )
@@ -58,8 +59,9 @@ class OffloadingConnectorWorker:
             or self.spec.config.parallel.rank == 0
         )
 
-        # job_id -> req_id for in-flight loads (None for sync loads).
+        # None for sync loads and partial batches that do not release a request.
         self._load_jobs: dict[int, ReqId | None] = {}
+        self._finished_loads: dict[ReqId, bool] = {}
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -250,6 +252,7 @@ class OffloadingConnectorWorker:
             assert success
         self._unsubmitted_store_jobs.clear()
 
+        self._finished_loads.update(metadata.finished_loads)
         sync_job_ids: set[int] = set()
         for job_id, entry in metadata.load_jobs.items():
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
@@ -261,7 +264,7 @@ class OffloadingConnectorWorker:
                     job_id, entry.src_spec, entry.dst_spec, expedited=True
                 )
             else:
-                self._load_jobs[job_id] = entry.req_id
+                self._load_jobs[job_id] = entry.req_id if entry.finish_request else None
                 success = self.worker.submit_load(
                     job_id, entry.src_spec, entry.dst_spec
                 )
@@ -284,17 +287,25 @@ class OffloadingConnectorWorker:
             )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        """Returns:
-        tuple of (finished_sending, finished_recving). Stores never
-        emit finished_sending — the scheduler tracks store completion
-        via kv_connector_worker_meta.completed_jobs and fences any
-        block reuse via jobs_to_flush. Loads still emit
-        finished_recving so the base scheduler can resume requests
-        blocked on remote KV (and free aborted-during-load reqs).
+        results = self.get_transfer_results(finished_req_ids)
+        return results.finished_sending, results.finished_recving
 
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        """Report completed receives and failures after all required copies.
+
+        Stores report only job acknowledgements; jobs_to_flush fences reuse.
+        Partial loads also report only job acknowledgements. The scheduler
+        sends their request-level outcome after every worker finishes every
+        batch, allowing the core to resume or free an aborted request.
         """
         assert self.worker is not None
-        finished_recving: set[str] = set()
+        finished_recving = set(self._finished_loads)
+        failed_recving = {
+            req_id for req_id, failed in self._finished_loads.items() if failed
+        }
+        self._finished_loads.clear()
         for transfer_result in self.worker.get_finished():
             # we currently do not support job failures
             job_id = transfer_result.job_id
@@ -318,7 +329,9 @@ class OffloadingConnectorWorker:
             if req_id is not None:
                 finished_recving.add(req_id)
 
-        return set(), finished_recving
+        return KVConnectorTransferResults(
+            finished_recving=finished_recving, failed_recving=failed_recving
+        )
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
@@ -331,6 +344,7 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._finished_loads.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()

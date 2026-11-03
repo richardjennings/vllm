@@ -64,6 +64,8 @@ class TransferJob:
     dst_spec: LoadStoreSpec
     # Load only: completed before this step's forward pass.
     sync: bool = False
+    # Partial restores acknowledge each copy without releasing the request.
+    finish_request: bool = True
 
 
 @dataclass
@@ -72,6 +74,9 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # Sent only after every batch has been acknowledged by every worker.
+    # True means restore failed; partially loaded KV must not be published.
+    finished_loads: dict[ReqId, bool] = field(default_factory=dict)
 
 
 @dataclass

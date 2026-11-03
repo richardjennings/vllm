@@ -101,6 +101,7 @@ vllm serve <model> \
 | --- | --- | --- | --- | --- |
 | `spec_name` | no | `CPUOffloadingSpec` | both | Set to `TieringOffloadingSpec` for multi-tier. |
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
+| `batched_loads` | no | `false` | multi-tier, filesystem only | Restore prefixes larger than the CPU tier through bounded disk-to-CPU-to-GPU batches. Requires room for at least one chunk. The request waits until every worker has restored the entire accepted prefix. |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |
 | `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). |
@@ -247,6 +248,14 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
 
 Each thread group prefers its own queue but pulls from the other when its primary queue is empty, so a write-heavy or read-heavy burst won't leave the off-priority queue waiting. Size the totals to your storage's effective concurrency.
+
+#### Restore with a small RAM buffer
+
+Set `"batched_loads": true` and `"cpu_bytes_to_use": 536870912` in `kv_connector_extra_config` to use at most 512 MiB of staging KV memory across all workers. The buffer must fit at least one chunk, including every rank's copy and alignment. This limit covers the shared KV buffer; vLLM still needs RAM for the model, request metadata and other runtime allocations.
+
+The scheduler reserves the matched prefix's GPU blocks, then transfers disk-to-CPU-to-GPU batches. It reuses a CPU slot only after every worker acknowledges its copy and permits generation only after the whole prefix is restored. Resident CPU hits are copied first. With retention enabled, the selected disk files remain pinned against expiry and quota eviction until restoration finishes or is cancelled; successful reads refresh their last-use time.
+
+Missing or unreadable data during restoration fails the receive without publishing partial KV. Set `"kv_load_failure_policy": "recompute"` at the top level of `kv_transfer_config` to recompute that request; the default `"fail"` reports an error. Cancellation and connector reset release the restore after outstanding GPU copies are fenced. This option currently supports filesystem secondary tiers only. The ordinary best-effort store path is unchanged: a save that cannot fit in the buffer can be skipped.
 
 #### Idle expiry and disk budget
 

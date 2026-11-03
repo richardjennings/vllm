@@ -256,6 +256,13 @@ class FileSystemTierManager(SecondaryTierManager):
         if self._retention is not None:
             self._retention.touch(self.file_mapper.get_file_name(key) for key in keys)
 
+    def pin_load(
+        self, keys: Collection[OffloadKey]
+    ) -> contextlib.AbstractContextManager[None]:
+        if self._retention is None:
+            return contextlib.nullcontext()
+        return self._retention.pin(self.file_mapper.get_file_name(key) for key in keys)
+
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)

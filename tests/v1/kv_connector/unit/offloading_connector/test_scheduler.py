@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
+import time
 import weakref
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, call
@@ -24,7 +27,7 @@ from tests.v1.kv_connector.unit.utils import (
     create_scheduler,
     create_vllm_config,
 )
-from vllm.config import KVEventsConfig, KVTransferConfig
+from vllm.config import KVEventsConfig, KVTransferConfig, ParallelConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     scheduler as scheduler_module,
@@ -94,6 +97,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
+from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -102,6 +106,170 @@ from vllm.v1.request import RequestStatus
 def _as_mock(value: object) -> MagicMock:
     assert isinstance(value, MagicMock)
     return value
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("blocks_per_chunk", [1, 4])
+def test_batched_restore_waits_for_all_four_workers(tmp_path, hybrid, blocks_per_chunk):
+    """Two staging slots restore a larger prefix; three acks cannot free a slot."""
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        )
+    ]
+    if hybrid:
+        groups.append(
+            KVCacheGroupSpec(
+                ["window"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=17,
+                ),
+            )
+        )
+    kv_config = KVCacheConfig(
+        num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+    config = replace(
+        create_vllm_config(
+            max_model_len=512,
+            kv_connector="OffloadingConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "spec_name": "TieringOffloadingSpec",
+                "cpu_bytes_to_use": 8192,
+                "blocks_per_chunk": blocks_per_chunk,
+                "batched_loads": True,
+                "secondary_tiers": [
+                    {
+                        "type": "fs",
+                        "root_dir": str(tmp_path),
+                        "idle_ttl_seconds": 300,
+                        "max_bytes": 65536,
+                    }
+                ],
+            },
+        ),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=4, distributed_executor_backend="mp"
+        ),
+    )
+    spec = TieringOffloadingSpec(build_offloading_config(config, kv_config))
+    scheduler = OffloadingConnectorScheduler(spec, config, kv_config)
+    manager = spec.get_manager()
+    assert spec.num_chunks == 2
+    cached_tokens = 64 * blocks_per_chunk
+    local_tokens = 16 if blocks_per_chunk == 4 else 0
+    req = create_request(num_tokens=cached_tokens + 1, block_size=16)
+    keys = [
+        make_offload_key(h, group)
+        for group in range(len(groups))
+        for h in req.block_hashes[blocks_per_chunk - 1 :: blocks_per_chunk]
+    ]
+    ctx = ReqContext(req_id="seed")
+    deadline = time.monotonic() + 20
+
+    def finish_tier_io():
+        while True:
+            assert time.monotonic() < deadline, "filesystem jobs stalled"
+            with manager.lock:
+                manager.on_schedule_end(scheduler_module.ScheduleEndContext((), ()))
+                if not manager.has_pending_work():
+                    return
+            threading.Event().wait(0.001)
+
+    view = manager.primary_tier.get_kv_memoryview().cast("B")
+    try:
+        with manager.lock:
+            manager.on_new_request(ctx)
+        for i, key in enumerate(keys):
+            with manager.lock:
+                store = manager.prepare_store([key], ctx)
+                assert store is not None
+                offset = int(store.store_spec.chunk_ids[0]) * spec.kv_bytes_per_chunk
+                view[offset : offset + spec.kv_bytes_per_chunk] = (
+                    bytes([i + 1]) * spec.kv_bytes_per_chunk
+                )
+                manager.complete_store([key], ctx)
+            finish_tier_io()
+        with manager.lock:
+            manager.on_request_finished(ctx)
+            manager.reset_cache()
+            manager.on_reset_flushed()
+        scheduler.on_new_request(req)
+        while True:
+            matched, asynchronous = scheduler.get_num_new_matched_tokens(
+                req, local_tokens
+            )
+            if matched is not None:
+                break
+            scheduler.build_connector_meta(SchedulerOutput.make_empty())
+            assert time.monotonic() < deadline
+        assert (matched, asynchronous) == (cached_tokens - local_tokens, True)
+        num_blocks = cached_tokens // 16
+        blocks = [[KVCacheBlock(i + 1) for i in range(num_blocks)]]
+        if hybrid:
+            blocks.append(
+                [KVCacheBlock(0, is_null=True) for _ in range(num_blocks - 2)]
+                + [KVCacheBlock(num_blocks * 2 - 1), KVCacheBlock(num_blocks * 2)]
+            )
+        scheduler.update_state_after_alloc(req, KVCacheBlocks(tuple(blocks)), matched)
+        req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        req.num_computed_tokens = cached_tokens
+        restored = set()
+        while True:
+            assert time.monotonic() < deadline, "batched restore stalled"
+            meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+            if meta.finished_loads:
+                assert meta.finished_loads == {req.request_id: False}
+                break
+            if not meta.load_jobs:
+                threading.Event().wait(0.001)
+                continue
+            assert len(meta.load_jobs) <= 2
+            staged = {}
+            for job in meta.load_jobs.values():
+                assert not job.finish_request
+                restored.update(job.dst_spec.block_ids.tolist())
+                offset = int(job.src_spec.chunk_ids[0]) * spec.kv_bytes_per_chunk
+                data = bytes(view[offset : offset + spec.kv_bytes_per_chunk])
+                expected = (int(job.dst_spec.block_ids[0]) - 1) // blocks_per_chunk + 1
+                assert data == bytes([expected]) * len(data)
+                staged[offset] = data
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs=dict.fromkeys(meta.load_jobs, 3),
+                    ),
+                )
+            )
+            waiting = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+            assert not waiting.load_jobs and not waiting.finished_loads
+            for offset, data in staged.items():
+                assert bytes(view[offset : offset + len(data)]) == data
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs=dict.fromkeys(meta.load_jobs, 1),
+                    ),
+                )
+            )
+        expected_blocks = set(range(local_tokens // 16 + 1, num_blocks + 1))
+        if hybrid:
+            expected_blocks.update((num_blocks * 2 - 1, num_blocks * 2))
+        assert restored == expected_blocks
+    finally:
+        view.release()
+        scheduler.shutdown()
 
 
 @pytest.mark.parametrize(

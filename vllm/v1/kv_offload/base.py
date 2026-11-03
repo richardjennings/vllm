@@ -306,6 +306,32 @@ class ConfigInfo:
 
 
 class OffloadingManager(ABC):
+    batched_loads: bool = False
+
+    def lookup_loadable(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        """Check a scheduler load; batching managers may accept secondary hits."""
+        return self.lookup(key, req_context)
+
+    def begin_batched_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Reserve a load larger than primary memory without promoting it all."""
+        raise NotImplementedError
+
+    def prepare_load_batch(
+        self, req_context: ReqContext
+    ) -> dict[OffloadKey, LoadStoreSpec]:
+        """Return ready, pinned chunks; complete_load releases each GPU transfer.
+
+        An empty result means I/O or primary capacity is pending. OSError means
+        the request's restore failed and must not publish partially loaded KV.
+        """
+        raise NotImplementedError
+
+    def end_batched_load(self, req_context: ReqContext) -> None:
+        """Release unused reservations after all submitted GPU copies finish."""
+        raise NotImplementedError
+
     @property
     def lock(self) -> AbstractContextManager[Any]:
         """Context manager granting exclusive access to this manager's state.

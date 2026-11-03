@@ -1397,6 +1397,160 @@ def test_fs_retention_real_generation_reuses_then_expires(
         assert expired.outputs[0].token_ids == initial.outputs[0].token_ids
 
 
+@pytest.mark.parametrize(
+    "model,num_tokens,staging_bytes,during_restore",
+    [
+        pytest.param("facebook/opt-125m", 1024, 9 << 20, action, id=f"opt-{action}")
+        for action in (
+            "complete",
+            "abort",
+            "corrupt",
+            "corrupt-fail",
+            "reset",
+            "concurrent",
+        )
+    ]
+    + [pytest.param("Qwen/Qwen3-8B", 8192, 512 << 20, "complete", id="qwen-512m")],
+)
+def test_fs_restores_prefix_larger_than_cpu_buffer(
+    tmp_path, vllm_runner, monkeypatch, model, num_tokens, staging_bytes, during_restore
+):
+    """A cold disk hit must load fully even when its KV exceeds staging RAM."""
+    from vllm import SamplingParams
+    from vllm.config import KVTransferConfig
+    from vllm.inputs import TokensPrompt
+    from vllm.outputs import RequestOutput
+    from vllm.v1.request import RequestStatus
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    prompt = TokensPrompt(prompt_token_ids=list(range(100, 100 + num_tokens)) + [7])
+    sampling = SamplingParams(temperature=0, max_tokens=1)
+    outputs: list[RequestOutput] = []
+    seed_bytes = max(128 << 20, 4 * staging_bytes)
+    for cpu_bytes in (seed_bytes, staging_bytes):
+        config = KVTransferConfig(
+            kv_connector="OffloadingConnector",
+            kv_role="kv_both",
+            kv_load_failure_policy="fail"
+            if during_restore == "corrupt-fail"
+            else "recompute",
+            kv_connector_extra_config={
+                "cpu_bytes_to_use": cpu_bytes,
+                "block_size": 64,
+                "spec_name": "TieringOffloadingSpec",
+                "batched_loads": True,
+                "secondary_tiers": [
+                    {
+                        "type": "fs",
+                        "root_dir": str(tmp_path),
+                        "idle_ttl_seconds": 300,
+                        "max_bytes": 2 * seed_bytes,
+                    }
+                ],
+            },
+        )
+        with vllm_runner(
+            model,
+            max_model_len=num_tokens + 1024,
+            gpu_memory_utilization=0.4 if model.startswith("Qwen/") else 0.1,
+            enforce_eager=True,
+            kv_transfer_config=config,
+        ) as runner:
+            if outputs and during_restore != "complete":
+                engine = runner.llm.llm_engine
+                req_id = engine.add_request("interrupted", prompt, sampling)
+                scheduler = engine.engine_core.engine_core.scheduler
+                request = scheduler.requests[req_id]
+                deadline = time.monotonic() + 60
+                while request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    assert time.monotonic() < deadline, "disk restoration did not start"
+                    assert not engine.step(), "generation completed before intervention"
+                if during_restore == "abort":
+                    engine.abort_request(["interrupted"])
+                elif during_restore.startswith("corrupt"):
+                    # Real filesystem fault after admission, before later batches.
+                    tier = scheduler.connector.scheduler.manager.secondary_tiers[0]
+                    last_key = make_offload_key(request.block_hashes[-1], 0)
+                    Path(tier.file_mapper.get_file_name(last_key)).write_bytes(b"")
+                elif during_restore == "reset":
+                    # GPU blocks stay reserved while a remote receive is active;
+                    # the connector reset must still cancel its staged restore.
+                    assert not runner.llm.reset_prefix_cache(reset_connector=True)
+                elif during_restore == "concurrent":
+                    engine.add_request("concurrent", prompt, sampling)
+                completed: list[RequestOutput] = []
+                while engine.has_unfinished_requests():
+                    assert time.monotonic() < deadline, (
+                        "interrupted restore did not finish"
+                    )
+                    completed.extend(o for o in engine.step() if o.finished)
+                assert len(completed) == (
+                    0
+                    if during_restore == "abort"
+                    else 2
+                    if during_restore == "concurrent"
+                    else 1
+                )
+                for result in completed:
+                    if during_restore == "corrupt-fail":
+                        assert result.outputs[0].finish_reason == "error"
+                        assert not result.outputs[0].token_ids
+                    else:
+                        assert (
+                            result.outputs[0].token_ids
+                            == outputs[0].outputs[0].token_ids
+                        )
+                if during_restore.startswith("corrupt"):
+                    # A failed restore must produce the recomputed answer, then
+                    # leave the engine usable for an unrelated request.
+                    other = runner.llm.generate(
+                        TokensPrompt(prompt_token_ids=[42, 43]),
+                        sampling,
+                        use_tqdm=False,
+                    )[0]
+                    assert other.finished
+                    continue
+            output = runner.llm.generate(prompt, sampling, use_tqdm=False)[0]
+            outputs.append(output)
+            if len(outputs) == 1:
+                deadline = time.monotonic() + 60
+                while len(list(tmp_path.rglob("*.bin"))) < num_tokens // 64:
+                    assert time.monotonic() < deadline, "disk stores did not finish"
+                    runner.llm.llm_engine.step()
+                    threading.Event().wait(0.01)
+                disk_bytes = sum(p.stat().st_size for p in tmp_path.rglob("*.bin"))
+                assert disk_bytes > staging_bytes
+            else:
+                assert output.num_cached_tokens == num_tokens
+                assert output.outputs[0].token_ids == outputs[0].outputs[0].token_ids
+
+
+def test_retention_pins_entire_restore_across_batches(retention, tmp_path):
+    policy, now = retention
+    first, second, third = (tmp_path / f"{name}.bin" for name in ("a", "b", "c"))
+    store_bytes(policy, first, b"aaaa")
+    store_bytes(policy, second, b"bbbb")
+    with policy.pin([str(first), str(second)]):
+        now[0] += 11
+        policy.maintain()
+        assert first.exists() and second.exists()
+        assert not policy.contains(str(second))  # New requests cannot lease idle data.
+        with pytest.raises(OSError) as error:
+            store_bytes(policy, third, b"cccc")
+        assert error.value.errno == errno.ENOSPC
+        loaded = []
+        for path in (first, second):
+            policy.load([str(path)], lambda path=path: loaded.append(path.read_bytes()))
+        assert loaded == [b"aaaa", b"bbbb"]
+    now[0] += 9
+    policy.maintain()
+    assert first.exists() and second.exists()
+    now[0] += 1
+    policy.maintain()
+    assert not first.exists() and not second.exists()
+
+
 def test_retention_duplicate_store_refreshes_without_rewriting(retention, tmp_path):
     policy, now = retention
     path = tmp_path / "a.bin"

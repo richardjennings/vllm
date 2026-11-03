@@ -74,6 +74,14 @@ MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
 
 
+def _lookup_loadable(
+    manager: OffloadingManager, key: OffloadKey, req_context: ReqContext
+) -> LookupResult:
+    if manager.batched_loads is True:
+        return manager.lookup_loadable(key, req_context)
+    return manager.lookup(key, req_context)
+
+
 @dataclass(slots=True)
 class TransferJobStatus:
     """Tracks scheduler-side state for a single transfer job."""
@@ -359,7 +367,7 @@ class RequestOffloadState:
     # number of hits in the GPU cache
     num_locally_computed_tokens: int = 0
     # In-flight job IDs. Per the connector's invariant, at any given time
-    # this contains either a single load job, or one or more store jobs.
+    # this contains load jobs or store jobs; asynchronous loads never overlap stores.
     transfer_jobs: set[int] = field(default_factory=set)
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
@@ -374,6 +382,10 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    finished_pending: bool = False
+    # GPU destinations remaining in a bounded-memory restore.
+    load_destinations: dict[OffloadKey, GPULoadStoreSpec] = field(default_factory=dict)
+    load_failed: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -670,6 +682,7 @@ class OffloadingConnectorScheduler:
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
+        self._batched_loads: set[ReqId] = set()
         # Requests loading synchronously in the current engine step
         self._current_batch_sync_loads: set[ReqId] = set()
         self._current_batch_sync_load_bytes = 0
@@ -823,7 +836,7 @@ class OffloadingConnectorScheduler:
         hit_count = 0
         defer_lookup = False
         for local_idx, key in enumerate(keys):
-            result = self.manager.lookup(key, req_context)
+            result = _lookup_loadable(self.manager, key, req_context)
             match result:
                 case LookupResult.HIT | LookupResult.HIT_PENDING:
                     self._events_tracker.record_lookup(
@@ -858,7 +871,7 @@ class OffloadingConnectorScheduler:
         consecutive_hits = 0
         required_window = initial_window_size or sliding_window_size
         for idx in range(len(keys) - 1, -1, -1):
-            match self.manager.lookup(keys[idx], req_context):
+            match _lookup_loadable(self.manager, keys[idx], req_context):
                 case LookupResult.HIT:
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
@@ -1165,7 +1178,7 @@ class OffloadingConnectorScheduler:
                 if group_state.lookup_hit_end_chunk_idx <= bridge_chunk_idx:
                     unconfirmed_bridge_keys.append((group_config, key))
             for _, key in unconfirmed_bridge_keys:
-                result = self.manager.lookup(key, req_status.req_context)
+                result = _lookup_loadable(self.manager, key, req_status.req_context)
                 if result is LookupResult.MISS:
                     max_boundary = bridge_boundary - tokens_per_hash
                     break
@@ -1220,7 +1233,7 @@ class OffloadingConnectorScheduler:
             key = self._make_boundary_key(
                 req, group_config.group_idx, key_tokens, req_context
             )
-            result = self.manager.lookup(key, req_context)
+            result = _lookup_loadable(self.manager, key, req_context)
             if result is LookupResult.MISS:
                 return False, pending
             pending |= result is not LookupResult.HIT
@@ -1288,7 +1301,7 @@ class OffloadingConnectorScheduler:
             # Restarting at token 0: offer every chunk again.
             group_state.next_stored_chunk_idx = 0
 
-        if req_status.transfer_jobs:
+        if req_status.transfer_jobs or request.request_id in self._batched_loads:
             logger.debug(
                 "Delaying request %s since it still has in-flight transfers",
                 request.request_id,
@@ -1340,7 +1353,8 @@ class OffloadingConnectorScheduler:
         self._current_batch_sync_loads.discard(req_id)
         # Keep at least one token to compute, or the request can't be scheduled.
         if (
-            not self.config.sync_load_budget_bytes
+            self.manager.batched_loads is True
+            or not self.config.sync_load_budget_bytes
             or not num_hit_tokens
             or num_computed_tokens + num_hit_tokens >= req_status.req.num_tokens
         ):
@@ -1524,10 +1538,14 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
                 group_state.next_stored_chunk_idx = num_chunks
 
-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
+        if self.manager.batched_loads is True:
+            self._begin_batched_load(req_status, keys_to_load, dst_spec)
+            req_status.partial_tail_boundary = None
+            return
+        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
@@ -1551,6 +1569,88 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None and not sync_load:
             self._chunks_being_loaded.update(keys_to_load)
         req_status.partial_tail_boundary = None
+
+    def _begin_batched_load(
+        self, status: RequestOffloadState, keys: list[OffloadKey], dst: GPULoadStoreSpec
+    ) -> None:
+        assert not status.transfer_jobs
+        key_iter = iter(keys)
+        offset = 0
+        num_groups = len(dst.group_sizes)
+        for group, (size, start) in enumerate(zip(dst.group_sizes, dst.block_indices)):
+            end = start + size
+            while start < end:
+                count = min(
+                    end - start,
+                    self.config.blocks_per_chunk - start % self.config.blocks_per_chunk,
+                )
+                sizes, indices = [0] * num_groups, [0] * num_groups
+                sizes[group], indices[group] = count, start
+                status.load_destinations[next(key_iter)] = GPULoadStoreSpec(
+                    dst.block_ids[offset : offset + count].tolist(), sizes, indices
+                )
+                start += count
+                offset += count
+        assert next(key_iter, None) is None
+        self._batched_loads.add(status.req.request_id)
+        if self._chunks_being_loaded is not None:
+            self._chunks_being_loaded.update(keys)
+        try:
+            self.manager.begin_batched_load(keys, status.req_context)
+        except OSError:
+            logger.exception(
+                "Could not reserve disk KV for request %s", status.req.request_id
+            )
+            status.load_failed = True
+
+    def _advance_batched_loads(self) -> dict[ReqId, bool]:
+        finished: dict[ReqId, bool] = {}
+        if self._reset_fence:
+            return finished
+        for req_id in list(self._batched_loads):
+            status = self._req_status[req_id]
+            if status.transfer_jobs:
+                continue
+            if (
+                not status.load_failed
+                and not status.req.is_finished()
+                and status.load_destinations
+            ):
+                try:
+                    ready = self.manager.prepare_load_batch(status.req_context)
+                except OSError:
+                    logger.exception("Disk KV restore failed for request %s", req_id)
+                    status.load_failed = True
+                else:
+                    for key, src_spec in ready.items():
+                        job_id = self._generate_job_id()
+                        self._current_batch_load_jobs[job_id] = TransferJob(
+                            req_id,
+                            src_spec,
+                            status.load_destinations.pop(key),
+                            finish_request=False,
+                        )
+                        status.transfer_jobs.add(job_id)
+                        self._jobs[job_id] = TransferJobStatus(
+                            req_id=req_id,
+                            pending_count=self.config.num_workers,
+                            keys={key},
+                            is_store=False,
+                        )
+                    continue
+            self.manager.end_batched_load(status.req_context)
+            if self._chunks_being_loaded is not None:
+                self._chunks_being_loaded.difference_update(status.load_destinations)
+            status.load_destinations.clear()
+            if status.load_failed:
+                # Recompute once instead of retrying the same failed restore.
+                status.max_load_tokens = 0
+            finished[req_id] = status.load_failed
+            self._batched_loads.remove(req_id)
+            if status.finished_pending:
+                self.manager.on_request_finished(status.req_context)
+                del self._req_status[req_id]
+        return finished
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update request states from the Scheduler's output."""
@@ -1614,6 +1714,8 @@ class OffloadingConnectorScheduler:
             for idx, config in enumerate(self.config.kv_group_configs)
         }
         for req_id, entries in handoffs.items():
+            if req_id in self._batched_loads:
+                continue
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
@@ -1689,6 +1791,8 @@ class OffloadingConnectorScheduler:
             return store_jobs
 
         for req_id, entries in handoffs.items():
+            if req_id in self._batched_loads:
+                continue
             entries = [
                 entry
                 for entry in entries
@@ -1875,6 +1979,8 @@ class OffloadingConnectorScheduler:
             scheduler_output.num_scheduled_tokens,
             scheduler_output.finished_req_ids or (),
         ):
+            if req_id in self._batched_loads:
+                continue
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
@@ -2219,10 +2325,12 @@ class OffloadingConnectorScheduler:
 
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        finished_loads = self._advance_batched_loads()
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            finished_loads=finished_loads,
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -2230,6 +2338,9 @@ class OffloadingConnectorScheduler:
         for req_id in scheduler_output.finished_req_ids or ():
             req_status = self._req_status.get(req_id)
             if req_status is None:
+                continue
+            if req_id in self._batched_loads:
+                req_status.finished_pending = True
                 continue
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
@@ -2263,7 +2374,7 @@ class OffloadingConnectorScheduler:
         A cache reset fence also keeps it stepping: the flush must reach the
         workers and their reports come back before on_reset_flushed().
         """
-        if self._jobs or self._reset_fence:
+        if self._jobs or self._reset_fence or self._batched_loads:
             return True
         with self._manager_locked():
             return self.manager.has_pending_work()
@@ -2359,7 +2470,11 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if req_status.finished_signaled and not req_status.transfer_jobs:
+            if (
+                req_status.finished_signaled
+                and not req_status.transfer_jobs
+                and job_status.req_id not in self._batched_loads
+            ):
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -2483,6 +2598,9 @@ class OffloadingConnectorScheduler:
         self._current_batch_jobs_to_flush.update(self._jobs.keys())
 
         for req_id, status in list(self._req_status.items()):
+            if req_id in self._batched_loads:
+                status.load_failed = True
+                continue
             if status.req.is_finished():
                 if not status.finished_signaled:
                     self.manager.on_request_finished(status.req_context)

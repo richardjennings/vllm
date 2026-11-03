@@ -22,6 +22,7 @@ Key Design Principles:
 import threading
 import time
 from collections.abc import Collection, Iterable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -56,6 +57,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
+from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
 from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
@@ -95,6 +97,15 @@ class PendingPromotion:
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
     chunk_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class BatchedLoad:
+    req_context: ReqContext
+    remaining: dict[OffloadKey, None]
+    ready: dict[OffloadKey, LoadStoreSpec] = field(default_factory=dict)
+    leases: ExitStack = field(default_factory=ExitStack)
+    failed: bool = False
 
 
 @dataclass(slots=True)
@@ -224,6 +235,7 @@ class TieringOffloadingManager(OffloadingManager):
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         tier_poll_interval_s: float = DEFAULT_TIER_POLL_INTERVAL_S,
+        batched_loads: bool = False,
     ):
         """Initialize the TieringOffloadingManager.
 
@@ -235,6 +247,8 @@ class TieringOffloadingManager(OffloadingManager):
                 tiers that set tolerates_off_thread_polling. Zero or negative
                 disables the thread, leaving those tiers serviced once per
                 engine step as before.
+            batched_loads: Restore filesystem hits through bounded primary-memory
+                batches instead of requiring the entire prefix to fit at once.
 
         """
         # Guards this manager and every tier it composes, the primary tier
@@ -243,6 +257,13 @@ class TieringOffloadingManager(OffloadingManager):
         self._lock = threading.Lock()
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        self.batched_loads = batched_loads
+        self._batched_loads: dict[str, BatchedLoad] = {}
+        self._request_load_tiers: dict[str, dict[OffloadKey, int]] = {}
+        if batched_loads and not all(
+            isinstance(tier, FileSystemTierManager) for tier in self.secondary_tiers
+        ):
+            raise ValueError("batched_loads currently supports filesystem tiers only")
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
@@ -492,6 +513,9 @@ class TieringOffloadingManager(OffloadingManager):
                 True,
             )
         if failed_keys:
+            for load in self._batched_loads.values():
+                if not load.remaining.keys().isdisjoint(failed_keys):
+                    load.failed = True
             self.primary_tier.complete_write(
                 failed_keys,
                 transfer_job.req_context,
@@ -673,6 +697,108 @@ class TieringOffloadingManager(OffloadingManager):
         if any_retry:
             return LookupResult.RETRY
         return LookupResult.MISS
+
+    @override
+    def lookup_loadable(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if not self.batched_loads:
+            return self.lookup(key, req_context)
+        self._maybe_process_finished_jobs()
+        start = time.monotonic()
+        result = self.primary_tier.lookup(key, req_context)
+        self._metrics.on_lookup(
+            req_context,
+            key,
+            self._metrics.primary_tier_label,
+            result,
+            time.monotonic() - start,
+        )
+        if result is not LookupResult.MISS:
+            return result
+        if self._promotions_held:
+            return LookupResult.MISS
+        retry = False
+        for tier_idx, tier in enumerate(self.secondary_tiers):
+            if not req_context.load_tier_filter.allows(tier.medium, tier.locality):
+                continue
+            start = time.monotonic()
+            result = tier.lookup(key, req_context)
+            self._metrics.on_lookup(
+                req_context,
+                key,
+                self._metrics.tier_label(tier_idx),
+                result,
+                time.monotonic() - start,
+            )
+            if result is LookupResult.HIT:
+                self._request_load_tiers.setdefault(req_context.req_id, {})[key] = (
+                    tier_idx
+                )
+                self._request_load_sources.setdefault(req_context.req_id, {})[key] = (
+                    tier.cache_hit_source
+                )
+                return result
+            retry |= result is LookupResult.RETRY
+        return LookupResult.RETRY if retry else LookupResult.MISS
+
+    @override
+    def begin_batched_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        assert req_context.req_id not in self._batched_loads
+        load = BatchedLoad(req_context, dict.fromkeys(keys))
+        self._batched_loads[req_context.req_id] = load
+        disk_keys: dict[int, list[OffloadKey]] = {}
+        try:
+            # Pin every resident hit before any promotion can evict it. These
+            # are transferred first, freeing staging slots for the disk hits.
+            for key in load.remaining:
+                if self.primary_tier.lookup(key, req_context) is LookupResult.HIT:
+                    load.ready[key] = self.primary_tier.prepare_load([key], req_context)
+                else:
+                    tier_idx = self._request_load_tiers[req_context.req_id][key]
+                    disk_keys.setdefault(tier_idx, []).append(key)
+            for tier_idx, tier_keys in disk_keys.items():
+                tier = self.secondary_tiers[tier_idx]
+                assert isinstance(tier, FileSystemTierManager)
+                load.leases.enter_context(tier.pin_load(tier_keys))
+        except OSError:
+            self.end_batched_load(req_context)
+            raise
+
+    @override
+    def prepare_load_batch(
+        self, req_context: ReqContext
+    ) -> dict[OffloadKey, LoadStoreSpec]:
+        self._maybe_process_finished_jobs()
+        load = self._batched_loads[req_context.req_id]
+        if load.failed:
+            raise OSError("Filesystem KV restore failed")
+        # Capture all completed promotions before allocating more slots.
+        for key in load.remaining:
+            if (
+                key not in load.ready
+                and self.primary_tier.lookup(key, req_context) is LookupResult.HIT
+            ):
+                load.ready[key] = self.primary_tier.prepare_load([key], req_context)
+        for key in load.remaining:
+            if key in load.ready:
+                continue
+            if self.primary_tier.lookup(key, req_context) is LookupResult.HIT_PENDING:
+                continue
+            tier_idx = self._request_load_tiers[req_context.req_id][key]
+            if not self._initiate_promotion(tier_idx, key, req_context):
+                break
+        ready, load.ready = load.ready, {}
+        for key in ready:
+            del load.remaining[key]
+        return ready
+
+    @override
+    def end_batched_load(self, req_context: ReqContext) -> None:
+        load = self._batched_loads.pop(req_context.req_id, None)
+        if load is not None:
+            self.primary_tier.complete_load(load.ready.keys(), req_context)
+            load.leases.close()
 
     @override
     def get_load_source(
@@ -1086,6 +1212,7 @@ class TieringOffloadingManager(OffloadingManager):
             tier.on_request_finished(state.req_context)
         self._metrics.on_request_finished(state.req_context)
         self._request_load_sources.pop(req_id, None)
+        self._request_load_tiers.pop(req_id, None)
         del self._req_state[req_id]
 
     @override
@@ -1182,6 +1309,9 @@ class TieringOffloadingManager(OffloadingManager):
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
         self._request_load_sources.clear()
+        self._request_load_tiers.clear()
+        for load in list(self._batched_loads.values()):
+            self.end_batched_load(load.req_context)
         self._metrics.assert_idle()
 
         finished_req_ids = []
@@ -1294,6 +1424,8 @@ class TieringOffloadingManager(OffloadingManager):
         self._shutdown_tiers()
 
     def _shutdown_tiers(self) -> None:
+        for load in list(self._batched_loads.values()):
+            self.end_batched_load(load.req_context)
         shutdown_error: Exception | None = None
         for tier_idx, tier in enumerate(self.secondary_tiers):
             try:

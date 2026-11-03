@@ -13,7 +13,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
     KVConnectorStats,
@@ -146,6 +149,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is not None:
             return self.connector_worker.build_connector_worker_meta()
         return None
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_transfer_results(finished_req_ids)
 
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None

@@ -9,6 +9,7 @@ heads, all block_size * dcp * pcp tokens, in the worker's page encoding.
 Uncertifiable layers get an opaque fallback mapping (fail closed).
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -403,7 +404,7 @@ def _unpadded_page_size(spec: KVCacheSpec) -> int | None:
 def derive_canonical_mappings(
     vllm_config: "VllmConfig",
     kv_cache_config: KVCacheConfig,
-    kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+    kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]],
 ) -> dict[str, CanonicalPageMapping]:
     """Per-layer canonical page mappings for this worker.
 
