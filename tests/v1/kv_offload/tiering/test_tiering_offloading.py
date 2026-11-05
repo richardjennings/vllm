@@ -342,6 +342,57 @@ class TestTieringOffloadingManager:
         if req_context.req_id not in self.manager._req_state:
             self.manager.on_new_request(req_context)
 
+    def test_backlog_larger_than_primary_is_stored_in_parts(self, manager_setup):
+        """Primary memory takes a long backlog as cascades free its chunks."""
+        self._start_request()
+        keys = to_keys(range(8))
+
+        assert self.manager.num_storable(keys, _CTX) == 5
+        output = self.manager.prepare_store(keys[:5], _CTX)
+        assert output is not None and output.keys_to_store == keys[:5]
+        # Written chunks are not evictable before they reach the other tiers.
+        assert self.manager.num_storable(keys[5:], _CTX) == 0
+
+        self.manager.complete_store(keys[:5], _CTX)
+        assert self.manager.num_storable(keys[5:], _CTX) == 3
+        output = self.manager.prepare_store(keys[5:], _CTX)
+        assert output is not None and output.keys_to_store == keys[5:]
+
+    @pytest.mark.parametrize("held_by_both", [True, False])
+    def test_chunks_held_by_every_secondary_tier_are_not_stored_again(
+        self, manager_setup, held_by_both: bool
+    ):
+        self._start_request()
+        keys = to_keys(range(12))
+        held = set(keys[0::2])
+        with (
+            patch.object(
+                self.secondary_tier1,
+                "holds",
+                side_effect=lambda ks: [k in held for k in ks],
+            ),
+            patch.object(
+                self.secondary_tier2,
+                "holds",
+                side_effect=lambda ks: [held_by_both and k in held for k in ks],
+            ),
+            patch.object(self.secondary_tier1, "touch") as touch,
+        ):
+            num_storable = self.manager.num_storable(keys, _CTX)
+            output = self.manager.prepare_store(keys[:num_storable], _CTX)
+
+        assert output is not None
+        if held_by_both:
+            # Six odd keys need memory and five chunks exist: the sixth stops
+            # the offer, and the held keys before it are only touched.
+            assert num_storable == 11
+            assert output.keys_to_store == keys[1:11:2]
+            touch.assert_called_once_with(set(keys[0:11:2]), _CTX)
+        else:
+            assert num_storable == 5
+            assert output.keys_to_store == keys[:5]
+            touch.assert_not_called()
+
     def test_failed_promotion_finalizes_primary_with_failure(self, manager_setup):
         """A failed promotion still finalizes the primary slots with
         success=False; the tier corrects its own verdict."""

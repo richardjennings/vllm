@@ -371,6 +371,21 @@ class CPUOffloadingManager(OffloadingManager):
             evicted_keys=to_evict,
         )
 
+    def num_storable_prefix(self, keys: Sequence[OffloadKey]) -> int:
+        """Return how many leading keys prepare_store can place.
+
+        A new key needs a free or evictable chunk. A resident idle key is not
+        evictable while it is offered.
+        """
+        available = self._get_num_free_chunks() + self._num_evictable_cache_chunks
+        for i, key in enumerate(keys):
+            chunk = self._policy.get(key)
+            if chunk is None or chunk.ref_cnt == 0:
+                available -= 1
+            if available < 0:
+                return i
+        return len(keys)
+
     @override
     def complete_store(
         self,

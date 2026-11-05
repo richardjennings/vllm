@@ -429,6 +429,17 @@ class OffloadingManager(ABC):
         """Notify tiers of GPU reuse without changing CPU cache recency policy."""
         return
 
+    def num_storable(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> int | None:
+        """Return how many leading keys prepare_store can accept now.
+
+        A manager whose primary memory stages stores for slower tiers takes a
+        backlog larger than that memory in parts. None means prepare_store
+        accepts or rejects the whole offer.
+        """
+        return None
+
     @abstractmethod
     def prepare_store(
         self,

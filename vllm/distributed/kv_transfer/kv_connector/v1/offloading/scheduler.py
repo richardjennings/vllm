@@ -386,6 +386,7 @@ class RequestOffloadState:
     # GPU destinations remaining in a bounded-memory restore.
     load_destinations: dict[OffloadKey, GPULoadStoreSpec] = field(default_factory=dict)
     load_failed: bool = False
+    store_failure_logged: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -1969,6 +1970,31 @@ class OffloadingConnectorScheduler:
             return None
         return alignment_tokens // group_config.tokens_per_block
 
+    def _store_token_limit(
+        self,
+        req_status: RequestOffloadState,
+        keys: list[OffloadKey],
+        end_tokens: list[int],
+    ) -> int | None:
+        """Bound a store to the leading tokens the manager can take now.
+
+        Keys are offered in token order across groups, and all keys ending at
+        one position are stored together, so the groups advance in step.
+
+        Returns:
+            None if the whole store fits, otherwise the last token position
+            to store, or 0 if nothing fits yet.
+
+        """
+        order = sorted(range(len(keys)), key=end_tokens.__getitem__)
+        num_keys = self.manager.num_storable(
+            [keys[i] for i in order], req_status.req_context
+        )
+        if num_keys is None or num_keys >= len(keys):
+            return None
+        limit = end_tokens[order[num_keys]] - 1
+        return limit if limit >= end_tokens[order[0]] else 0
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -2007,6 +2033,7 @@ class OffloadingConnectorScheduler:
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            key_end_tokens: list[int] = []
             group_store_ranges: list[tuple[int, int]] = []
 
             reachable_boundaries: tuple[int, ...] = ()
@@ -2139,10 +2166,33 @@ class OffloadingConnectorScheduler:
                     ):
                         continue
                     new_offload_keys.append(offload_key)
+                    key_end_tokens.append(
+                        (abs_chunk_idx + 1) * group_config.tokens_per_chunk
+                    )
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
+
+            limit = self._store_token_limit(
+                req_status, new_offload_keys, key_end_tokens
+            )
+            if limit == 0:
+                logger.debug("Request %s: offload memory full, store deferred", req_id)
+                continue
+            if limit is not None:
+                new_offload_keys = [
+                    key
+                    for key, end_token in zip(new_offload_keys, key_end_tokens)
+                    if end_token <= limit
+                ]
+                group_store_ranges = [
+                    (start, min(end, limit // group_config.tokens_per_chunk))
+                    for (start, end), group_config in zip(
+                        group_store_ranges, self.config.kv_group_configs
+                    )
+                ]
+                num_offloadable_tokens = limit
 
             store_output = self.manager.prepare_store(
                 new_offload_keys, req_status.req_context
@@ -2151,11 +2201,21 @@ class OffloadingConnectorScheduler:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
-                logger.warning("Request %s: cannot store chunks", req_id)
+                if not req_status.store_failure_logged:
+                    req_status.store_failure_logged = True
+                    logger.warning(
+                        "Request %s: cannot store chunks; retrying on later steps",
+                        req_id,
+                    )
                 continue
 
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                for group_state, (_, end) in zip(
+                    req_status.group_states, group_store_ranges
+                ):
+                    group_state.next_stored_chunk_idx = max(
+                        group_state.next_stored_chunk_idx, end
+                    )
                 continue
 
             keys_to_store = set(store_output.keys_to_store)

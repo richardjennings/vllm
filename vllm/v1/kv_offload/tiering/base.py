@@ -4,7 +4,7 @@
 
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -311,6 +311,13 @@ class SecondaryTierManager(ABC):
 
         """
         return
+
+    def holds(self, keys: Sequence[OffloadKey]) -> list[bool]:
+        """Report which chunks this tier is known to hold, without I/O.
+
+        Unknown counts as not held, so the chunk is stored again.
+        """
+        return [False] * len(keys)
 
     @abstractmethod
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
