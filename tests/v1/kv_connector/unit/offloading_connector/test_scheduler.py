@@ -1683,6 +1683,103 @@ def test_cache_reset_fence_held_too_long_warns_on_idle_steps(monkeypatch):
         scheduler.shutdown()
 
 
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_store_larger_than_offload_memory_drains_in_token_order(
+    request_runner, async_scheduling: bool
+):
+    """A store larger than the manager takes at once continues on later steps.
+
+    Each step offers the oldest unstored chunks the manager can take, so the
+    whole prompt is stored and no chunk is skipped or offered twice.
+    """
+    runner = request_runner(
+        block_size=4, num_gpu_blocks=100, async_scheduling=async_scheduling
+    )
+    runner.new_request(token_ids=[0] * 4 * 6)
+    runner.manager.num_storable.side_effect = lambda keys, req_context: min(
+        len(keys), 2
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    runner.run(decoded_tokens=[0, 0, 0, EOS_TOKEN_ID], expected_stored=tuple(range(6)))
+
+    offers = [c.args[0] for c in runner.manager.prepare_store.call_args_list]
+    assert all(len(offer) <= 2 for offer in offers)
+    offered = [key for offer in offers for key in offer]
+    assert len(offered) == len(set(offered)) == 6
+
+
+def test_store_waits_while_offload_memory_is_full(request_runner):
+    runner = request_runner(block_size=4, num_gpu_blocks=100, async_scheduling=False)
+    runner.new_request(token_ids=[0] * 4 * 2)
+    capacity = [0]
+    runner.manager.num_storable.side_effect = lambda keys, req_context: min(
+        len(keys), capacity[0]
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    runner.run(decoded_tokens=[0])
+    runner.manager.prepare_store.assert_not_called()
+
+    capacity[0] = 2
+    runner.run(decoded_tokens=[0, EOS_TOKEN_ID], expected_stored=(0, 1))
+
+
+def test_store_in_parts_keeps_kv_groups_at_the_same_position(request_runner):
+    """Keys ending at one token position are stored together across groups."""
+    block_size = 4
+    groups = [
+        KVCacheGroupSpec(
+            [f"layer{i}"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        )
+        for i in range(2)
+    ]
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        kv_cache_groups=groups,
+    )
+    runner.new_request(token_ids=[0] * block_size * 3)
+    # Three keys fit, but the third would split a position between groups.
+    runner.manager.num_storable.side_effect = lambda keys, req_context: min(
+        len(keys), 3
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    runner.run(decoded_tokens=[0, 0, 0, EOS_TOKEN_ID], expected_stored=(0, 1, 2))
+
+    for c in runner.manager.prepare_store.call_args_list:
+        group_ids = sorted(get_offload_group_idx(key) for key in c.args[0])
+        assert group_ids == [0, 1]
+
+
+def test_store_failure_is_logged_once_per_request(request_runner, monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(scheduler_module, "logger", logger)
+    runner = request_runner(block_size=4, num_gpu_blocks=10, async_scheduling=False)
+    runner.new_request(token_ids=[0] * 4)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: None
+
+    runner.run(decoded_tokens=[0, 0, 0, 0, EOS_TOKEN_ID])
+
+    assert runner.manager.prepare_store.call_count > 1
+    warnings = [c for c in logger.warning.call_args_list if "cannot store" in c.args[0]]
+    assert len(warnings) == 1
+
+
 def test_scheduler_reports_allocation_failure(request_runner):
     runner = request_runner(
         block_size=4,

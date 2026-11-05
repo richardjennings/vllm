@@ -18,7 +18,7 @@ import contextlib
 import functools
 import json
 import os
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -255,6 +255,16 @@ class FileSystemTierManager(SecondaryTierManager):
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         if self._retention is not None:
             self._retention.touch(self.file_mapper.get_file_name(key) for key in keys)
+
+    @override
+    def holds(self, keys: Sequence[OffloadKey]) -> list[bool]:
+        # Without retention metadata, knowing requires filesystem I/O.
+        if self._retention is None:
+            return super().holds(keys)
+        return [
+            self._retention.contains(self.file_mapper.get_file_name(key))
+            for key in keys
+        ]
 
     def pin_load(
         self, keys: Collection[OffloadKey]

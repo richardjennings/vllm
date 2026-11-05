@@ -985,10 +985,16 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = True
         self._process_finished_jobs()
 
-        # Step 2: Store to primary tier (new chunks only).
+        # Step 2: Store to primary tier (new chunks only). Chunks every
+        # secondary tier already holds are only touched.
         # Cascading of these newly-stored chunks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
+        held = self._held_by_secondary_tiers(keys, req_context)
+        if held:
+            for tier in self.secondary_tiers:
+                tier.touch(held, req_context)
+            keys = [key for key in keys if key not in held]
         primary_result = self.primary_tier.prepare_store(keys, req_context)
 
         if primary_result is None:
@@ -1011,6 +1017,53 @@ class TieringOffloadingManager(OffloadingManager):
                 )
 
         return primary_result
+
+    @override
+    def num_storable(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> int | None:
+        if not self.secondary_tiers:
+            return None
+        # As in prepare_store: count chunks that finished cascades free.
+        self._processed_jobs_this_step = True
+        self._process_finished_jobs()
+        held = self._held_by_secondary_tiers(keys, req_context)
+        num_new = self.primary_tier.num_storable_prefix(
+            [key for key in keys if key not in held]
+        )
+        for i, key in enumerate(keys):
+            if key in held:
+                continue
+            if num_new == 0:
+                return i
+            num_new -= 1
+        return len(keys)
+
+    def _held_by_secondary_tiers(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> set[OffloadKey]:
+        """Keys missing from primary that every secondary tier already holds.
+
+        Storing them would copy them through primary memory for nothing.
+        Request-level tiers expect every chunk, so none are skipped for them.
+        """
+        if (
+            not self.secondary_tiers
+            or self._req_state[req_context.req_id].request_level_tiers
+        ):
+            return set()
+        candidates = [
+            key
+            for key in keys
+            if self.primary_tier.lookup(key, req_context) is LookupResult.MISS
+        ]
+        for tier in self.secondary_tiers:
+            if not candidates:
+                break
+            candidates = [
+                key for key, held in zip(candidates, tier.holds(candidates)) if held
+            ]
+        return set(candidates)
 
     def _cascade_existing_chunks_to_request_level_tiers(
         self,

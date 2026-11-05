@@ -1526,6 +1526,97 @@ def test_fs_restores_prefix_larger_than_cpu_buffer(
                 assert output.outputs[0].token_ids == outputs[0].outputs[0].token_ids
 
 
+def test_fs_holds_reports_retained_blocks_without_io(tmp_path):
+    spec = CPUOffloadingSpec(make_offloading_config())
+    buffer = mmap.mmap(-1, mmap.PAGESIZE * 2)
+    view = memoryview(buffer).cast("B", shape=[2, mmap.PAGESIZE])
+    args = dict(
+        offloading_spec=spec,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+    )
+    tier = FileSystemTierManager(**args, idle_ttl_seconds=3600, max_bytes=1 << 20)
+    try:
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert [result.success for result in drain(tier)] == [True]
+        assert tier.holds([key(1), key(2)]) == [True, False]
+    finally:
+        tier.shutdown()
+    # Without retention metadata the tier cannot answer without I/O.
+    tier = FileSystemTierManager(**args)
+    try:
+        assert tier.holds([key(1)]) == [False]
+    finally:
+        tier.shutdown()
+        view.release()
+        buffer.close()
+
+
+@pytest.mark.parametrize(
+    "model,num_tokens,staging_bytes",
+    [
+        pytest.param("facebook/opt-125m", 1024, 9 << 20, id="opt"),
+        pytest.param("Qwen/Qwen3-8B", 8192, 512 << 20, id="qwen-512m"),
+    ],
+)
+def test_fs_stores_prefix_larger_than_cpu_buffer(
+    tmp_path, vllm_runner, monkeypatch, model, num_tokens, staging_bytes
+):
+    """KV larger than staging RAM reaches disk in parts and is reused from it."""
+    from vllm import SamplingParams
+    from vllm.config import KVTransferConfig
+    from vllm.inputs import TokensPrompt
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    prompt = TokensPrompt(prompt_token_ids=list(range(100, 100 + num_tokens)) + [7])
+    # Decoding steps give the stores time to drain through staging memory.
+    sampling = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True)
+    config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "cpu_bytes_to_use": staging_bytes,
+            "block_size": 64,
+            "spec_name": "TieringOffloadingSpec",
+            "batched_loads": True,
+            "secondary_tiers": [
+                {
+                    "type": "fs",
+                    "root_dir": str(tmp_path),
+                    "idle_ttl_seconds": 300,
+                    "max_bytes": 8 << 30,
+                }
+            ],
+        },
+    )
+    with vllm_runner(
+        model,
+        max_model_len=num_tokens + 1024,
+        gpu_memory_utilization=0.4 if model.startswith("Qwen/") else 0.1,
+        enforce_eager=True,
+        kv_transfer_config=config,
+    ) as runner:
+        llm = runner.llm
+        first = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        deadline = time.monotonic() + 60
+        while len(list(tmp_path.rglob("*.bin"))) < num_tokens // 64:
+            assert time.monotonic() < deadline, "disk stores did not finish"
+            llm.llm_engine.step()
+            threading.Event().wait(0.01)
+        disk_bytes = sum(p.stat().st_size for p in tmp_path.rglob("*.bin"))
+        assert disk_bytes > staging_bytes
+
+        assert llm.reset_prefix_cache(reset_connector=True)
+        llm.llm_engine.step()
+        again = llm.generate(prompt, sampling, use_tqdm=False)[0]
+        assert again.num_cached_tokens == num_tokens
+        assert again.outputs[0].token_ids == first.outputs[0].token_ids
+
+
 def test_retention_pins_entire_restore_across_batches(retention, tmp_path):
     policy, now = retention
     first, second, third = (tmp_path / f"{name}.bin" for name in ("a", "b", "c"))
